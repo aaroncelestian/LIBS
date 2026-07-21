@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from calibration import (
+    CONCENTRATION_UNIT_CHOICES,
     CalibrationSet,
     CurveFit,
     ElementPrediction,
@@ -40,15 +42,20 @@ from calibration import (
     apply_concentrations,
     acquisition_mismatch_warnings,
     build_fits,
+    concentration_level_summary,
+    concentration_units_convertible,
+    convert_calibration_concentrations,
     ensure_element_columns,
     flag_line_overlaps,
     load_calibration_set,
     load_concentrations_csv,
+    normalize_concentration_unit,
+    peak_integration_view,
     predict_concentrations,
     save_calibration_set,
     save_concentrations_csv,
-    save_predictions_csv,
     seed_lines_from_matches,
+    set_standard_concentrations,
     suggest_diagnostic_lines,
 )
 from identify_elements import ElementHit, LibraryLine, Spectrum
@@ -60,14 +67,14 @@ ROOT = Path(__file__).resolve().parent
 class CurveCanvas(FigureCanvasQTAgg):
     def __init__(self) -> None:
         apply_matplotlib_config()
-        self.fig = Figure(figsize=(5.5, 4.0), dpi=100)
-        self.ax = self.fig.add_subplot(111)
+        # Compact figure; panels are rebuilt as a 2×N grid on redraw
+        self.fig = Figure(figsize=(9.0, 6.2), dpi=100)
         super().__init__(self.fig)
         self.fig.tight_layout()
 
 
 class CalibrationTab(QWidget):
-    """CRM standards → diagnostic lines → I→C curves → apply to unknown."""
+    """CRM standards → diagnostic lines → I→C curves (Quant from Identify → Quant tab)."""
 
     statusMessage = Signal(str)
 
@@ -77,7 +84,6 @@ class CalibrationTab(QWidget):
         self.library: list[LibraryLine] = []
         self._unknown: Spectrum | None = None
         self._identify_hits: list[ElementHit] = []
-        self._last_preds: list[ElementPrediction] = []
         self._block_conc = False
         self._build_ui()
         self._enable_standards_drag_drop()
@@ -107,17 +113,33 @@ class CalibrationTab(QWidget):
         std_l = QVBoxLayout(std_box)
         btn_row = QHBoxLayout()
         self.btn_add_std = QPushButton("Add spectrum…")
+        self.btn_add_std.setToolTip(
+            "Add one or more CRM spectra.\n"
+            "Replicate shots of the same standard are encouraged — "
+            "each file is a separate calibration point."
+        )
         self.btn_add_std.clicked.connect(self._add_standards)
         self.btn_remove_std = QPushButton("Remove")
+        self.btn_remove_std.setToolTip("Remove highlighted standard(s).")
         self.btn_remove_std.clicked.connect(self._remove_standard)
+        self.btn_set_conc = QPushButton("Set C…")
+        self.btn_set_conc.setToolTip(
+            "Assign the same concentration to highlighted standards\n"
+            "(e.g. all six 1500 ppm Pb replicates → Pb = 1500)."
+        )
+        self.btn_set_conc.clicked.connect(self._set_concentration_selected)
         btn_row.addWidget(self.btn_add_std)
         btn_row.addWidget(self.btn_remove_std)
+        btn_row.addWidget(self.btn_set_conc)
         btn_row.addStretch(1)
         std_l.addLayout(btn_row)
 
         self.std_list = QListWidget()
+        self.std_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.std_list.setToolTip(
-            "CRM / standard spectra.\n"
+            "CRM / standard spectra (multi-select with Shift/⌘).\n"
+            "Replicates at the same C each become a point on the I→C curve — "
+            "that scatter is empirical LIBS error.\n"
             "Drag-and-drop .txt files or a folder here to add standards."
         )
         self.std_list.currentRowChanged.connect(self._on_standard_selected)
@@ -175,7 +197,7 @@ class CalibrationTab(QWidget):
         self.el_list = QListWidget()
         self.el_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.el_list.itemChanged.connect(self._on_element_check_changed)
-        self.el_list.itemSelectionChanged.connect(self._fill_line_table)
+        self.el_list.itemSelectionChanged.connect(self._on_element_selection_changed)
         el_l.addWidget(self.el_list)
         left_l.addWidget(el_box, stretch=1)
 
@@ -190,11 +212,27 @@ class CalibrationTab(QWidget):
         conc_btn.addWidget(self.btn_import_csv)
         conc_btn.addWidget(self.btn_export_csv)
         conc_btn.addStretch(1)
+        conc_btn.addWidget(QLabel("Unit"))
+        self.combo_unit = QComboBox()
+        self.combo_unit.setEditable(True)
+        self.combo_unit.addItems(list(CONCENTRATION_UNIT_CHOICES))
+        self.combo_unit.setCurrentText("wt%")
+        self.combo_unit.setMinimumWidth(100)
+        self.combo_unit.setToolTip(
+            "Unit for CRM concentrations and predictions.\n"
+            "Switching between wt%, ppm, mg/kg, µg/g, and mass frac\n"
+            "converts entered values automatically.\n"
+            "at% / oxide wt% are labels only (no conversion)."
+        )
+        self.combo_unit.currentTextChanged.connect(self._on_unit_changed)
+        conc_btn.addWidget(self.combo_unit)
         conc_l.addLayout(conc_btn)
 
         self.conc_table = QTableWidget(0, 1)
         self.conc_table.setToolTip(
-            "Known concentrations.\n"
+            "Known concentrations in the selected unit.\n"
+            "One row per spectrum — replicate shots of the same CRM should share "
+            "the same C (use Set C… on the standards list).\n"
             "Drag-and-drop a concentrations CSV here to import."
         )
         self.conc_table.setHorizontalHeaderLabels(["standard_id"])
@@ -205,7 +243,8 @@ class CalibrationTab(QWidget):
         self.conc_table.cellChanged.connect(self._on_conc_cell_changed)
         conc_l.addWidget(self.conc_table)
         self.conc_box_hint = QLabel(
-            "Values in wt%. CSV: standard_id, Element1, … (blank = skip)"
+            "Enter certificate values in the selected unit "
+            "(ppm = mg/kg = µg/g). CSV: standard_id, Element1, …"
         )
         self.conc_box_hint.setStyleSheet("color: #666; font-size: 11px;")
         conc_l.addWidget(self.conc_box_hint)
@@ -238,47 +277,82 @@ class CalibrationTab(QWidget):
         self.spin_half.setRange(0.05, 2.0)
         self.spin_half.setSingleStep(0.05)
         self.spin_half.setDecimals(2)
-        self.spin_half.setValue(0.20)
+        self.spin_half.setValue(0.15)
         self.spin_half.setSuffix(" nm")
-        self.spin_half.setToolTip("Integration half-width around diagnostic λ")
-        form.addRow("Integrate ±", self.spin_half)
+        self.spin_half.setToolTip(
+            "Peak half-width around diagnostic λ.\n"
+            "Net area = everything between the baseline edge anchors "
+            "(half-width + inner pad), not a fitted Voigt profile."
+        )
+        self.spin_half.valueChanged.connect(self._on_integration_params_changed)
+        form.addRow("Peak window ±", self.spin_half)
 
         self.spin_pad = QDoubleSpinBox()
-        self.spin_pad.setRange(0.05, 3.0)
-        self.spin_pad.setSingleStep(0.05)
+        self.spin_pad.setRange(0.02, 3.0)
+        self.spin_pad.setSingleStep(0.02)
         self.spin_pad.setDecimals(2)
-        self.spin_pad.setValue(0.40)
+        self.spin_pad.setValue(0.12)
         self.spin_pad.setSuffix(" nm")
-        self.spin_pad.setToolTip("Extra pad outside core for local baseline wings")
+        self.spin_pad.setToolTip(
+            "Pad outside the peak window. Outer ~40% of each pad = continuum "
+            "anchors; the inner pad is included in net area so shoulders are not cut off."
+        )
+        self.spin_pad.valueChanged.connect(self._on_integration_params_changed)
         form.addRow("Baseline pad", self.spin_pad)
+
+        self.combo_baseline = QComboBox()
+        self.combo_baseline.addItem("Linear (edge→edge)", "linear")
+        self.combo_baseline.addItem("Flat (edge mean)", "flat")
+        self.combo_baseline.setToolTip(
+            "Linear: continuum tilted between left/right edge strips.\n"
+            "Flat: constant level from both edge strips (better when neighbors "
+            "bias one side)."
+        )
+        self.combo_baseline.currentIndexChanged.connect(self._on_integration_params_changed)
+        form.addRow("Baseline", self.combo_baseline)
+
+        self.combo_peak_model = QComboBox()
+        self.combo_peak_model.addItem("Gaussian fit", "gaussian")
+        self.combo_peak_model.addItem("Voigt fit", "voigt")
+        self.combo_peak_model.addItem("Net area", "net_area")
+        self.combo_peak_model.setToolTip(
+            "How peak intensity is measured for I→C.\n"
+            "Gaussian/Voigt: fit the line and allow a local λ shift;\n"
+            "area under the fitted profile is the intensity.\n"
+            "Net area: trapezoid between edge anchors (no parametric fit)."
+        )
+        self.combo_peak_model.currentIndexChanged.connect(self._on_integration_params_changed)
+        form.addRow("Peak model", self.combo_peak_model)
+
+        self.spin_shift = QDoubleSpinBox()
+        self.spin_shift.setRange(0.01, 0.50)
+        self.spin_shift.setSingleStep(0.01)
+        self.spin_shift.setDecimals(3)
+        self.spin_shift.setValue(0.15)
+        self.spin_shift.setSuffix(" nm")
+        self.spin_shift.setToolTip(
+            "Max |fitted − NIST| wavelength shift allowed for Gaussian/Voigt fits."
+        )
+        self.spin_shift.valueChanged.connect(self._on_integration_params_changed)
+        form.addRow("Shift tol", self.spin_shift)
 
         self.combo_degree = QComboBox()
         self.combo_degree.addItem("Linear", 1)
         self.combo_degree.addItem("Quadratic", 2)
-        form.addRow("Fit", self.combo_degree)
+        form.addRow("I→C fit", self.combo_degree)
 
         self.combo_atm = QComboBox()
         self.combo_atm.addItems(["air", "argon", "unknown"])
         self.combo_atm.currentTextChanged.connect(self._on_atm_changed)
         form.addRow("Atmosphere", self.combo_atm)
-
-        self.combo_unit = QComboBox()
-        self.combo_unit.setEditable(True)
-        self.combo_unit.addItems(
-            ["wt%", "ppm", "µg/g", "mg/kg", "at%", "oxide wt%", "mass frac"]
-        )
-        self.combo_unit.setCurrentText("wt%")
-        self.combo_unit.setToolTip(
-            "Unit for CRM concentrations and predictions.\n"
-            "The fit does not convert units — use one unit for the whole session."
-        )
-        self.combo_unit.currentTextChanged.connect(self._on_unit_changed)
-        form.addRow("Conc. unit", self.combo_unit)
         params_outer.addLayout(form)
 
         fit_btns = QVBoxLayout()
         self.btn_fit = QPushButton("Build calibration curves")
-        self.btn_fit.setToolTip("Fit I→C curves, then open the Curves & results tab.")
+        self.btn_fit.setToolTip(
+            "Fit I→C curves, then open the Curves & results tab. "
+            "Quant unknowns from Identify → Quant tab."
+        )
         self.btn_fit.clicked.connect(self._run_fit)
         self.btn_save = QPushButton("Save session…")
         self.btn_save.clicked.connect(self._save_session)
@@ -312,12 +386,32 @@ class CalibrationTab(QWidget):
         plot_l.setContentsMargins(4, 4, 4, 4)
 
         plot_hint = QLabel(
-            "Select a diagnostic line on Data entry to show its calibration curve. "
-            "Predict unknowns below."
+            "Top row: peak fits for the selected element’s best lines (by R²). "
+            "Bottom row: matching I→C curves. Green = fitted λ, red dotted = NIST. "
+            "Quant unknowns from Identify → Quant tab. Rebuild after changing windows / peak model."
         )
         plot_hint.setStyleSheet("color: #555; font-size: 11px;")
         plot_hint.setWordWrap(True)
         plot_l.addWidget(plot_hint)
+
+        peak_ctrl = QHBoxLayout()
+        peak_ctrl.addWidget(QLabel("QC spectrum"))
+        self.combo_peak_spec = QComboBox()
+        self.combo_peak_spec.setToolTip(
+            "Spectrum used for the peak-fit panels.\n"
+            "Uses Peak window / baseline / peak model from Fit parameters."
+        )
+        self.combo_peak_spec.currentIndexChanged.connect(self._redraw_plots)
+        peak_ctrl.addWidget(self.combo_peak_spec, stretch=1)
+        peak_ctrl.addWidget(QLabel("Show"))
+        self.spin_n_panels = QSpinBox()
+        self.spin_n_panels.setRange(1, 4)
+        self.spin_n_panels.setValue(4)
+        self.spin_n_panels.setToolTip("How many top-R² lines to show for the selected element.")
+        self.spin_n_panels.valueChanged.connect(self._redraw_plots)
+        peak_ctrl.addWidget(self.spin_n_panels)
+        peak_ctrl.addWidget(QLabel("lines"))
+        plot_l.addLayout(peak_ctrl)
 
         self.curve_canvas = CurveCanvas()
         self.curve_toolbar = NavigationToolbar2QT(self.curve_canvas, plot_page)
@@ -326,47 +420,22 @@ class CalibrationTab(QWidget):
             QSize(max(12, icon.width() // 2), max(12, icon.height() // 2))
         )
         plot_l.addWidget(self.curve_toolbar)
-        plot_l.addWidget(self.curve_canvas, stretch=3)
+        plot_l.addWidget(self.curve_canvas, stretch=1)
 
         self.fit_label = QLabel("No fits yet.")
         self.fit_label.setStyleSheet("color: #333;")
         self.fit_label.setWordWrap(True)
         plot_l.addWidget(self.fit_label)
 
-        apply_box = QGroupBox("Apply to unknown")
-        apply_l = QVBoxLayout(apply_box)
-        apply_btns = QHBoxLayout()
-        self.btn_use_identify = QPushButton("Use Identify spectrum")
-        self.btn_use_identify.clicked.connect(self._use_identify_spectrum)
-        self.btn_browse_unknown = QPushButton("Browse unknown…")
-        self.btn_browse_unknown.clicked.connect(self._browse_unknown)
-        self.btn_predict = QPushButton("Predict concentrations")
-        self.btn_predict.clicked.connect(self._predict)
-        self.btn_export_pred = QPushButton("Export predictions…")
-        self.btn_export_pred.clicked.connect(self._export_predictions)
-        apply_btns.addWidget(self.btn_use_identify)
-        apply_btns.addWidget(self.btn_browse_unknown)
-        apply_btns.addWidget(self.btn_predict)
-        apply_btns.addWidget(self.btn_export_pred)
-        apply_l.addLayout(apply_btns)
-        self.unknown_label = QLabel("Unknown: (none)")
-        apply_l.addWidget(self.unknown_label)
-        self.pred_table = QTableWidget(0, 4)
-        self.pred_table.setHorizontalHeaderLabels(
-            ["Element", "Concentration (wt%)", "± std", "# lines"]
-        )
-        self.pred_table.horizontalHeader().setStretchLastSection(True)
-        self.pred_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        apply_l.addWidget(self.pred_table)
-        plot_l.addWidget(apply_box, stretch=2)
-
         self.plot_page = plot_page
         self.sub_tabs.addTab(plot_page, "Curves & results")
+        self._update_unit_labels()
 
     def _show_plot_tab(self) -> None:
         if hasattr(self, "sub_tabs") and hasattr(self, "plot_page"):
             self.sub_tabs.setCurrentWidget(self.plot_page)
-            self._redraw_curve()
+            self._refresh_peak_spectrum_combo()
+            self._redraw_plots()
 
     def _on_line_selection_for_plot(self) -> None:
         """Keep curve in sync; if already on plot tab, redraw immediately."""
@@ -375,7 +444,376 @@ class CalibrationTab(QWidget):
             and hasattr(self, "plot_page")
             and self.sub_tabs.currentWidget() is self.plot_page
         ):
-            self._redraw_curve()
+            self._redraw_plots()
+
+    def _on_integration_params_changed(self, *_args) -> None:
+        self._sync_params_from_ui()
+        if (
+            hasattr(self, "sub_tabs")
+            and hasattr(self, "plot_page")
+            and self.sub_tabs.currentWidget() is self.plot_page
+        ):
+            self._redraw_plots()
+
+    def _refresh_peak_spectrum_combo(self) -> None:
+        if not hasattr(self, "combo_peak_spec"):
+            return
+        prev = self.combo_peak_spec.currentData()
+        self.combo_peak_spec.blockSignals(True)
+        self.combo_peak_spec.clear()
+        for i, s in enumerate(self.cal.standards):
+            self.combo_peak_spec.addItem(f"Standard: {s.sample_id}", ("std", i))
+        if self._unknown is not None:
+            self.combo_peak_spec.addItem(
+                f"Identify: {self._unknown.meta.path.name}", ("unknown", None)
+            )
+        # Restore prior selection when possible
+        if prev is not None:
+            for i in range(self.combo_peak_spec.count()):
+                if self.combo_peak_spec.itemData(i) == prev:
+                    self.combo_peak_spec.setCurrentIndex(i)
+                    break
+        self.combo_peak_spec.blockSignals(False)
+
+    def _peak_qc_spectrum(self) -> tuple[Spectrum | None, str]:
+        """Return (spectrum, label) for the Peak QC combo selection."""
+        if not hasattr(self, "combo_peak_spec") or self.combo_peak_spec.count() == 0:
+            if self.cal.standards:
+                s = self.cal.standards[0]
+                return s.spectrum, s.sample_id
+            return self._unknown, (
+                self._unknown.meta.path.name if self._unknown is not None else ""
+            )
+        data = self.combo_peak_spec.currentData()
+        if not data:
+            return None, ""
+        kind, idx = data
+        if kind == "std" and idx is not None and 0 <= int(idx) < len(self.cal.standards):
+            s = self.cal.standards[int(idx)]
+            return s.spectrum, s.sample_id
+        if kind == "unknown" and self._unknown is not None:
+            return self._unknown, self._unknown.meta.path.name
+        return None, ""
+
+    def _selected_element(self) -> str | None:
+        # Prefer highlighted element in the left list
+        if hasattr(self, "el_list"):
+            items = self.el_list.selectedItems()
+            if items:
+                return items[0].text().strip() or None
+        el, _ = self._selected_diagnostic_wavelength()
+        if el:
+            return el
+        if self.cal.fits:
+            return self.cal.fits[0].element
+        active = self.cal.active_elements()
+        return active[0] if active else None
+
+    def _on_element_selection_changed(self) -> None:
+        self._fill_line_table()
+        self._on_line_selection_for_plot()
+
+    def _top_fits_for_element(self, element: str | None, n: int = 4) -> list[CurveFit]:
+        """Best I→C fits for ``element`` by R² (descending), up to ``n``."""
+        if not element:
+            return []
+        fits = [f for f in self.cal.fits if f.element == element]
+        fits.sort(key=lambda f: (-float(f.r_squared), float(f.wavelength_nm)))
+        return fits[: max(1, min(int(n), 4))]
+
+    def _redraw_plots(self, *_args) -> None:
+        if not hasattr(self, "curve_canvas"):
+            return
+        fig = self.curve_canvas.fig
+        fig.clear()
+        self._sync_params_from_ui()
+
+        el = self._selected_element()
+        n_want = int(self.spin_n_panels.value()) if hasattr(self, "spin_n_panels") else 4
+        fits = self._top_fits_for_element(el, n_want)
+        spec, label = self._peak_qc_spectrum()
+
+        if not fits:
+            ax = fig.add_subplot(111)
+            ax.text(
+                0.5,
+                0.5,
+                "Build calibration curves, then select an element / line\n"
+                "on Data entry to inspect the top fits.",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                color="#666",
+            )
+            ax.set_axis_off()
+            fig.tight_layout(pad=0.4)
+            self.curve_canvas.draw_idle()
+            return
+
+        n = len(fits)
+        for i, fit in enumerate(fits):
+            ax_peak = fig.add_subplot(2, n, i + 1)
+            ax_curve = fig.add_subplot(2, n, n + i + 1)
+            self._draw_peak_panel_for_fit(ax_peak, fit, spec, label)
+            self._draw_curve_for_fit(ax_curve, fit)
+
+        fig.suptitle(
+            f"{el} — top {n} line(s) by R² · QC: {label or '—'}",
+            fontsize=11,
+            y=0.995,
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.97), pad=0.35, w_pad=0.6, h_pad=0.8)
+        self.curve_canvas.draw_idle()
+
+    def _draw_peak_panel_for_fit(
+        self,
+        ax,
+        fit: CurveFit,
+        spec: Spectrum | None,
+        label: str,
+    ) -> None:
+        center = float(fit.wavelength_nm)
+        el = fit.element
+        if spec is None:
+            ax.text(
+                0.5,
+                0.5,
+                "Add a standard\nto preview",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                color="#666",
+                fontsize=8,
+            )
+            ax.set_title(f"{el} {center:.3f}", fontsize=9)
+            return
+        view = peak_integration_view(
+            spec,
+            center,
+            half_width_nm=self.cal.half_width_nm,
+            pad_nm=self.cal.baseline_pad_nm,
+            method=self.cal.baseline_method,
+            peak_model=self.cal.peak_model,
+            shift_tol_nm=self.cal.shift_tol_nm,
+        )
+        if view is None or len(view.wavelength_nm) < 2:
+            ax.text(
+                0.5,
+                0.5,
+                f"No samples\nnear {center:.3f} nm",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                color="#666",
+                fontsize=8,
+            )
+            ax.set_title(f"{el} {center:.3f}", fontsize=9)
+            return
+        self._draw_peak_integration(
+            ax,
+            view,
+            title_prefix=f"{el} {center:.3f}",
+            compact=True,
+        )
+
+    def _draw_curve_for_fit(self, ax, fit: CurveFit) -> None:
+        x = np.asarray(fit.intensities, dtype=float)
+        y = np.asarray(fit.concentrations, dtype=float)
+        ax.scatter(x, y, c="#1a5276", s=28, zorder=3, alpha=0.85)
+        if len(x):
+            x_line = np.linspace(float(np.nanmin(x)) * 0.95, float(np.nanmax(x)) * 1.05, 60)
+            y_line = np.polyval(fit.coeffs, x_line)
+            ax.plot(x_line, y_line, color="#c0392b", lw=1.3)
+        n_pts, n_levels = concentration_level_summary(list(fit.concentrations))
+        ax.set_xlabel("Peak area", fontsize=8)
+        ax.set_ylabel(self._unit_label(), fontsize=8)
+        level_txt = f"{n_levels} C level{'s' if n_levels != 1 else ''}"
+        ax.set_title(
+            f"I→C  R²={fit.r_squared:.3f}  n={n_pts} ({level_txt})",
+            fontsize=9,
+        )
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.25)
+
+    def _redraw_peak_qc(self) -> None:
+        """Backward-compatible alias — redraws the full Curves grid."""
+        self._redraw_plots()
+
+    def _selected_diagnostic_wavelength(self) -> tuple[str | None, float | None]:
+        """Element + λ from line table selection, else current fit, else first enabled line."""
+        fit = self._current_fit()
+        if fit is not None:
+            return fit.element, float(fit.wavelength_nm)
+        rows = self.line_table.selectionModel().selectedRows() if hasattr(self, "line_table") else []
+        if rows:
+            item = self.line_table.item(rows[0].row(), 0)
+            if item is not None:
+                key = item.data(Qt.ItemDataRole.UserRole)
+                if key:
+                    el, wl = key
+                    return str(el), float(wl)
+        for d in self.cal.diagnostic_lines:
+            if d.enabled:
+                return d.element, float(d.wavelength_nm)
+        return None, None
+
+    @staticmethod
+    def _draw_peak_integration(
+        ax, view, *, title_prefix: str = "", compact: bool = False
+    ) -> None:
+        """Render peak QC with baseline, optional fit overlay, tight FOV."""
+        center = view.center_nm
+        wl = view.wavelength_nm
+        y = view.intensity
+        base = view.baseline
+        i_lo = view.integrate_lo_nm
+        i_hi = view.integrate_hi_nm
+        core = (wl >= i_lo) & (wl <= i_hi)
+        peak_model = getattr(view, "peak_model", "net_area") or "net_area"
+        fit_ok = bool(getattr(view, "fit_ok", False)) and peak_model != "net_area"
+        fs_title = 8 if compact else 10
+        fs_lab = 7 if compact else 9
+        lw = 1.0 if compact else 1.35
+
+        ax.axvspan(
+            view.edge_lo_nm,
+            view.edge_hi_left_nm,
+            color="#e67e22",
+            alpha=0.22,
+            zorder=0,
+            label="Edge anchors" if not compact else None,
+        )
+        ax.axvspan(
+            view.edge_lo_right_nm,
+            view.edge_hi_nm,
+            color="#e67e22",
+            alpha=0.22,
+            zorder=0,
+        )
+        ax.plot(wl, y, color="#1a252f", lw=lw, label="Raw" if not compact else None, zorder=3)
+        ax.plot(
+            wl,
+            base,
+            color="#d35400",
+            lw=lw,
+            ls="--",
+            label="Baseline" if not compact else None,
+            zorder=3,
+        )
+
+        if fit_ok and len(view.fit_wavelength_nm) and len(view.fit_intensity):
+            ax.plot(
+                view.fit_wavelength_nm,
+                view.fit_intensity,
+                color="#1e8449",
+                lw=1.5 if compact else 1.8,
+                label=f"{peak_model} fit" if not compact else None,
+                zorder=4,
+            )
+            base_on_fit = np.interp(
+                view.fit_wavelength_nm, wl, base, left=base[0], right=base[-1]
+            )
+            ax.fill_between(
+                view.fit_wavelength_nm,
+                base_on_fit,
+                view.fit_intensity,
+                where=(view.fit_intensity >= base_on_fit),
+                color="#1e8449",
+                alpha=0.22,
+                zorder=2,
+            )
+            ax.axvline(
+                view.fitted_center_nm,
+                color="#1e8449",
+                lw=1.0 if compact else 1.2,
+                ls="-",
+                label=(
+                    None
+                    if compact
+                    else f"Fitted λ ({view.delta_nm:+.3f} nm)"
+                ),
+                zorder=5,
+            )
+        elif np.any(core):
+            ax.fill_between(
+                wl[core],
+                base[core],
+                y[core],
+                where=(y[core] >= base[core]),
+                color="#1a5276",
+                alpha=0.38,
+                label="Net area" if not compact else None,
+                zorder=2,
+            )
+
+        ax.axvline(
+            center,
+            color="#c0392b",
+            lw=1.0 if compact else 1.15,
+            ls=":",
+            label="NIST λ" if not compact else None,
+            zorder=4,
+        )
+        if not compact:
+            ax.axvline(i_lo, color="#2980b9", lw=0.9, ls="--", alpha=0.7, zorder=2)
+            ax.axvline(i_hi, color="#2980b9", lw=0.9, ls="--", alpha=0.7, zorder=2)
+
+        # Tight FOV: peak body (+ modest margin), always including net-area bounds
+        yc = np.asarray(view.corrected, dtype=float)
+        ymax_c = float(np.nanmax(yc)) if len(yc) else 0.0
+        if ymax_c > 0:
+            above = yc >= (0.06 * ymax_c)
+            if np.count_nonzero(above) >= 2:
+                idx = np.flatnonzero(above)
+                p_lo = float(wl[idx[0]])
+                p_hi = float(wl[idx[-1]])
+            else:
+                p_lo, p_hi = i_lo, i_hi
+        else:
+            p_lo, p_hi = i_lo, i_hi
+        x0 = min(p_lo, i_lo, view.edge_hi_left_nm)
+        x1 = max(p_hi, i_hi, view.edge_lo_right_nm)
+        if fit_ok:
+            x0 = min(x0, view.fitted_center_nm)
+            x1 = max(x1, view.fitted_center_nm)
+        margin = max(0.012, 0.07 * max(x1 - x0, 1e-6))
+        x0 -= margin
+        x1 += margin
+        ax.set_xlim(x0, x1)
+
+        in_view = (wl >= x0) & (wl <= x1)
+        if np.any(in_view):
+            y_lo = float(min(np.nanmin(y[in_view]), np.nanmin(base[in_view])))
+            y_hi = float(max(np.nanmax(y[in_view]), np.nanmax(base[in_view])))
+            if fit_ok and len(view.fit_intensity):
+                y_hi = max(y_hi, float(np.nanmax(view.fit_intensity)))
+            pad_y = 0.10 * max(y_hi - y_lo, 1.0)
+            ax.set_ylim(y_lo - 0.5 * pad_y, y_hi + pad_y)
+
+        ax.set_xlabel("λ (nm)" if compact else "Wavelength (nm)", fontsize=fs_lab)
+        ax.set_ylabel("counts" if compact else "Intensity (counts)", fontsize=fs_lab)
+        ax.tick_params(labelsize=6 if compact else 8)
+        prefix = f"{title_prefix} · " if title_prefix else ""
+        if fit_ok:
+            if compact:
+                ax.set_title(
+                    f"{prefix}Δλ={view.delta_nm:+.3f}  A={view.area:.3g}",
+                    fontsize=fs_title,
+                )
+            else:
+                bl_lbl = "flat" if view.method == "flat" else "linear"
+                ax.set_title(
+                    f"{prefix}{peak_model}  area={view.area:.4g}  "
+                    f"Δλ={view.delta_nm:+.3f} nm  FWHM={view.fwhm_nm:.3f} nm  "
+                    f"({bl_lbl} baseline)",
+                    fontsize=fs_title,
+                )
+        else:
+            note = "fit→net" if peak_model != "net_area" else "net"
+            ax.set_title(f"{prefix}{note} A={view.area:.3g}", fontsize=fs_title)
+        if not compact:
+            ax.legend(loc="upper right", fontsize=7, framealpha=0.92)
+        ax.grid(True, alpha=0.28)
 
     # -------------------------------------------------------------- wiring
     def set_library(self, library: list[LibraryLine]) -> None:
@@ -391,7 +829,7 @@ class CalibrationTab(QWidget):
         self._identify_hits = list(hits)
         if spectrum is not None:
             self._unknown = spectrum
-            self.unknown_label.setText(f"Unknown: {spectrum.meta.path.name} (Identify)")
+            self._refresh_peak_spectrum_combo()
         if atmosphere in ("air", "argon", "unknown"):
             self.combo_atm.blockSignals(True)
             self.combo_atm.setCurrentText(atmosphere)
@@ -418,9 +856,16 @@ class CalibrationTab(QWidget):
     def _sync_params_from_ui(self) -> None:
         self.cal.half_width_nm = float(self.spin_half.value())
         self.cal.baseline_pad_nm = float(self.spin_pad.value())
+        method = self.combo_baseline.currentData()
+        self.cal.baseline_method = str(method or "linear")
+        peak_model = self.combo_peak_model.currentData()
+        self.cal.peak_model = str(peak_model or "gaussian")
+        self.cal.shift_tol_nm = float(self.spin_shift.value())
         self.cal.fit_degree = int(self.combo_degree.currentData())
         self.cal.atmosphere = self.combo_atm.currentText()
         self.cal.concentration_unit = self.combo_unit.currentText().strip() or "wt%"
+        if hasattr(self, "spin_shift"):
+            self.spin_shift.setEnabled(self.cal.peak_model != "net_area")
 
     def _on_atm_changed(self, atm: str) -> None:
         self.cal.atmosphere = atm
@@ -428,23 +873,72 @@ class CalibrationTab(QWidget):
             s.atmosphere = atm
 
     def _on_unit_changed(self, unit: str) -> None:
-        self.cal.concentration_unit = (unit or "").strip() or "wt%"
+        new_unit = normalize_concentration_unit(unit)
+        old_unit = normalize_concentration_unit(
+            self.cal.concentration_unit or "wt%"
+        )
+        if new_unit.lower() == old_unit.lower():
+            self.cal.concentration_unit = new_unit
+            self._update_unit_labels()
+            return
+
+        converted = 0
+        if concentration_units_convertible(old_unit, new_unit):
+            converted = convert_calibration_concentrations(
+                self.cal, old_unit, new_unit
+            )
+            # Existing fits were in the old unit — clear so user rebuilds
+            if converted and self.cal.fits:
+                self.cal.fits = []
+                if hasattr(self, "fit_label"):
+                    self.fit_label.setText(
+                        "Unit changed — rebuild calibration curves."
+                    )
+                if hasattr(self, "data_fit_label"):
+                    self.data_fit_label.setText(
+                        "Unit changed — rebuild calibration curves."
+                    )
+        elif any(
+            v is not None
+            for s in self.cal.standards
+            for v in s.concentrations.values()
+        ):
+            QMessageBox.information(
+                self,
+                "Unit label only",
+                f"Cannot auto-convert between {old_unit} and {new_unit}.\n"
+                "Entered numbers are left unchanged — use wt%, ppm, mg/kg, "
+                "µg/g, or mass frac for automatic conversion.",
+            )
+
+        self.cal.concentration_unit = new_unit
         self._update_unit_labels()
+        self._refresh_conc_table()
+        if converted:
+            self.statusMessage.emit(
+                f"Converted {converted} concentration value(s) "
+                f"{old_unit} → {new_unit}"
+            )
+        else:
+            self.statusMessage.emit(f"Concentration unit: {new_unit}")
 
     def _unit_label(self) -> str:
         u = (self.cal.concentration_unit or self.combo_unit.currentText() or "wt%").strip()
-        return u or "wt%"
+        return normalize_concentration_unit(u) or "wt%"
 
     def _update_unit_labels(self) -> None:
         u = self._unit_label()
-        if hasattr(self, "pred_table"):
-            self.pred_table.setHorizontalHeaderLabels(
-                ["Element", f"Concentration ({u})", "± std", "# lines"]
-            )
         if hasattr(self, "conc_box_hint"):
-            self.conc_box_hint.setText(
-                f"Values in {u}. CSV: standard_id, Element1, … (blank = skip)"
-            )
+            if concentration_units_convertible(u, "ppm"):
+                self.conc_box_hint.setText(
+                    f"Values in {u} (ppm = mg/kg = µg/g; convertible to wt%). "
+                    "CSV: standard_id, Element1, … (blank = skip)"
+                )
+            else:
+                self.conc_box_hint.setText(
+                    f"Values in {u} (label only — no auto-conversion). "
+                    "CSV: standard_id, Element1, … (blank = skip)"
+                )
     # ----------------------------------------------------------- standards
     def _add_standards(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -459,6 +953,7 @@ class CalibrationTab(QWidget):
     def _add_standard_paths(self, paths: list[Path]) -> None:
         if not paths:
             return
+        before = len(self.cal.standards)
         added = 0
         for p in paths:
             try:
@@ -476,16 +971,111 @@ class CalibrationTab(QWidget):
         self._refresh_standards_list()
         self._refresh_conc_table()
         self._update_acquisition_warnings(popup=True)
+        new_idxs = list(range(before, len(self.cal.standards)))
         self.statusMessage.emit(f"Standards: {len(self.cal.standards)} (+{added})")
+        if len(new_idxs) >= 1:
+            # Highlight newly added rows
+            self.std_list.clearSelection()
+            for i in new_idxs:
+                item = self.std_list.item(i)
+                if item is not None:
+                    item.setSelected(True)
+            if self.cal.elements:
+                reply = QMessageBox.question(
+                    self,
+                    "Assign concentration?",
+                    f"Assign the same concentration to the {len(new_idxs)} "
+                    f"newly added spectrum{'a' if len(new_idxs) != 1 else ''}?\n\n"
+                    "Use this for replicate shots of one CRM "
+                    "(e.g. six files all at 1500 ppm Pb).",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes if len(new_idxs) > 1 else QMessageBox.StandardButton.No,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._set_concentration_for_indices(new_idxs)
 
     def _remove_standard(self) -> None:
-        row = self.std_list.currentRow()
-        if row < 0 or row >= len(self.cal.standards):
+        rows = sorted(
+            {self.std_list.row(it) for it in self.std_list.selectedItems()},
+            reverse=True,
+        )
+        if not rows:
+            row = self.std_list.currentRow()
+            if row >= 0:
+                rows = [row]
+        if not rows:
             return
-        del self.cal.standards[row]
+        for row in rows:
+            if 0 <= row < len(self.cal.standards):
+                del self.cal.standards[row]
         self._refresh_standards_list()
         self._refresh_conc_table()
         self._update_acquisition_warnings(popup=False)
+
+    def _set_concentration_selected(self) -> None:
+        rows = sorted({self.std_list.row(it) for it in self.std_list.selectedItems()})
+        if not rows:
+            QMessageBox.information(
+                self,
+                "Set concentration",
+                "Highlight one or more standards in the list, then Set C…\n"
+                "(Shift/⌘-click to multi-select replicates.)",
+            )
+            return
+        self._set_concentration_for_indices(rows)
+
+    def _set_concentration_for_indices(self, indices: list[int]) -> None:
+        if not indices:
+            return
+        if not self.cal.elements:
+            # Offer to add an element first
+            el, ok = QInputDialog.getText(
+                self,
+                "Element",
+                "Element symbol (e.g. Pb):",
+            )
+            if not ok or not el.strip():
+                return
+            el = el.strip()
+            # Title-case common symbols
+            if len(el) <= 2:
+                el = el[0].upper() + (el[1:].lower() if len(el) > 1 else "")
+            if el not in self.cal.elements:
+                self.cal.elements.append(el)
+                ensure_element_columns(self.cal, self.cal.elements)
+                self._refresh_element_list()
+        else:
+            el, ok = QInputDialog.getItem(
+                self,
+                "Element",
+                f"Set concentration for {len(indices)} standard(s):",
+                self.cal.elements,
+                0,
+                False,
+            )
+            if not ok or not el:
+                return
+        unit = self._unit_label()
+        value, ok = QInputDialog.getDouble(
+            self,
+            "Concentration",
+            f"{el} concentration ({unit}) for {len(indices)} spectrum"
+            f"{'a' if len(indices) != 1 else ''}:",
+            1500.0 if unit.lower() in ("ppm", "mg/kg", "µg/g", "ug/g") else 0.15,
+            -1e12,
+            1e12,
+            6,
+        )
+        if not ok:
+            return
+        n = set_standard_concentrations(
+            self.cal.standards, el, float(value), indices=indices
+        )
+        self._refresh_conc_table()
+        self.statusMessage.emit(
+            f"Set {el}={value:g} {unit} on {n} standard"
+            f"{'s' if n != 1 else ''} (replicates share C; each shot is a point)."
+        )
 
     def _refresh_standards_list(self) -> None:
         self.std_list.clear()
@@ -495,6 +1085,7 @@ class CalibrationTab(QWidget):
         if self.cal.standards:
             self.std_list.setCurrentRow(0)
         self._update_acquisition_warnings(popup=False)
+        self._refresh_peak_spectrum_combo()
 
     def _update_acquisition_warnings(self, *, popup: bool = False) -> list[str]:
         """Surface mismatched laser / gate / integration settings across CRMs."""
@@ -970,95 +1561,6 @@ class CalibrationTab(QWidget):
             self.line_table.selectRow(0)
         self._show_plot_tab()
 
-    def _predict(self) -> None:
-        self._sync_quantify_from_list()
-        if not self.cal.active_elements():
-            QMessageBox.information(
-                self,
-                "Predict",
-                "Check the elements you want to quantify (left panel).",
-            )
-            return
-        if self._unknown is None:
-            QMessageBox.information(self, "Predict", "Load an unknown spectrum first.")
-            return
-        if not self.cal.fits:
-            self._run_fit()
-        if not self.cal.fits:
-            return
-        self._sync_params_from_ui()
-        preds = predict_concentrations(self.cal, self._unknown)
-        self._last_preds = preds
-        self.pred_table.setRowCount(len(preds))
-        for i, p in enumerate(preds):
-            self.pred_table.setItem(i, 0, QTableWidgetItem(p.element))
-            self.pred_table.setItem(i, 1, QTableWidgetItem(f"{p.concentration:g}"))
-            std_txt = "—" if p.std is None else f"{p.std:g}"
-            self.pred_table.setItem(i, 2, QTableWidgetItem(std_txt))
-            self.pred_table.setItem(i, 3, QTableWidgetItem(str(p.n_lines)))
-        self.pred_table.resizeColumnsToContents()
-        self._plot_predictions(preds)
-        self.statusMessage.emit(
-            f"Predicted {len(preds)} checked element(s)"
-        )
-
-    def _plot_predictions(self, preds: list[ElementPrediction]) -> None:
-        """Bar chart of selected quantified elements (with multi-line ±std)."""
-        ax = self.curve_canvas.ax
-        ax.clear()
-        if not preds:
-            ax.text(
-                0.5,
-                0.5,
-                "No predictions for checked elements",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-            )
-            self.curve_canvas.draw_idle()
-            return
-        names = [p.element for p in preds]
-        vals = [p.concentration for p in preds]
-        errs = [0.0 if p.std is None else p.std for p in preds]
-        x = np.arange(len(names))
-        ax.bar(x, vals, color="#1a5276", alpha=0.85, zorder=2)
-        if any(e > 0 for e in errs):
-            ax.errorbar(
-                x,
-                vals,
-                yerr=errs,
-                fmt="none",
-                ecolor="#922b21",
-                capsize=4,
-                zorder=3,
-            )
-        ax.set_xticks(x)
-        ax.set_xticklabels(names)
-        ax.set_ylabel(f"Concentration ({self._unit_label()})")
-        ax.set_title("Quantified elements (checked subset)")
-        self.curve_canvas.fig.tight_layout()
-        self.curve_canvas.draw_idle()
-
-    def _export_predictions(self) -> None:
-        if not self._last_preds:
-            QMessageBox.information(
-                self, "Export", "Run Predict concentrations first."
-            )
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export predictions CSV",
-            str(ROOT / "docs" / "predictions.csv"),
-            "CSV (*.csv)",
-        )
-        if not path:
-            return
-        self._sync_params_from_ui()
-        save_predictions_csv(
-            Path(path), self._last_preds, unit=self.cal.concentration_unit
-        )
-        self.statusMessage.emit(f"Wrote {path}")
-
     def _current_fit(self) -> CurveFit | None:
         rows = self.line_table.selectionModel().selectedRows() if self.line_table.selectionModel() else []
         if rows:
@@ -1071,60 +1573,6 @@ class CalibrationTab(QWidget):
                         if f.element == el and abs(f.wavelength_nm - wl) < 1e-6:
                             return f
         return self.cal.fits[0] if self.cal.fits else None
-
-    def _redraw_curve(self) -> None:
-        ax = self.curve_canvas.ax
-        ax.clear()
-        fit = self._current_fit()
-        if fit is None:
-            ax.text(0.5, 0.5, "Build calibration curves", ha="center", va="center", transform=ax.transAxes)
-            self.curve_canvas.draw_idle()
-            return
-        x = np.asarray(fit.intensities, dtype=float)
-        y = np.asarray(fit.concentrations, dtype=float)
-        ax.scatter(x, y, c="#1a5276", s=40, zorder=3, label="Standards")
-        for sid, xi, yi in zip(fit.sample_ids, x, y):
-            ax.annotate(sid, (xi, yi), textcoords="offset points", xytext=(4, 4), fontsize=8)
-        if len(x):
-            x_line = np.linspace(float(x.min()) * 0.95, float(x.max()) * 1.05, 80)
-            y_line = np.polyval(fit.coeffs, x_line)
-            ax.plot(x_line, y_line, color="#c0392b", lw=1.5, label=f"Fit R²={fit.r_squared:.3f}")
-        ax.set_xlabel("Net peak area (counts·nm)")
-        ax.set_ylabel(f"Concentration ({self._unit_label()})")
-        ax.set_title(f"{fit.element} — {fit.wavelength_nm:.3f} nm")
-        ax.legend(loc="best", fontsize=8)
-        self.curve_canvas.fig.tight_layout()
-        self.curve_canvas.draw_idle()
-
-    # ----------------------------------------------------------- unknown
-    def _use_identify_spectrum(self) -> None:
-        if self._unknown is None:
-            QMessageBox.information(
-                self,
-                "Unknown",
-                "No Identify spectrum loaded yet. Open a spectrum on the Identify tab.",
-            )
-            return
-        self.unknown_label.setText(f"Unknown: {self._unknown.meta.path.name} (Identify)")
-        self.statusMessage.emit(f"Using Identify spectrum: {self._unknown.meta.path.name}")
-
-    def _browse_unknown(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open unknown spectrum",
-            str(ROOT / "docs"),
-            "Spectrum text (*.txt);;All files (*)",
-        )
-        if not path:
-            return
-        from identify_elements import load_spectrum
-
-        try:
-            self._unknown = load_spectrum(Path(path))
-        except Exception as exc:
-            QMessageBox.critical(self, "Load error", str(exc))
-            return
-        self.unknown_label.setText(f"Unknown: {self._unknown.meta.path.name}")
 
     # ---------------------------------------------------------- session
     def _save_session(self) -> None:
@@ -1161,6 +1609,14 @@ class CalibrationTab(QWidget):
             return
         self.spin_half.setValue(self.cal.half_width_nm)
         self.spin_pad.setValue(self.cal.baseline_pad_nm)
+        bidx = self.combo_baseline.findData(self.cal.baseline_method or "linear")
+        if bidx >= 0:
+            self.combo_baseline.setCurrentIndex(bidx)
+        pidx = self.combo_peak_model.findData(self.cal.peak_model or "gaussian")
+        if pidx >= 0:
+            self.combo_peak_model.setCurrentIndex(pidx)
+        self.spin_shift.setValue(self.cal.shift_tol_nm)
+        self.spin_shift.setEnabled((self.cal.peak_model or "gaussian") != "net_area")
         idx = self.combo_degree.findData(self.cal.fit_degree)
         if idx >= 0:
             self.combo_degree.setCurrentIndex(idx)
@@ -1176,7 +1632,8 @@ class CalibrationTab(QWidget):
         self._refresh_conc_table()
         self._fill_line_table()
         self._update_acquisition_warnings(popup=False)
-        self._redraw_curve()
+        self._refresh_peak_spectrum_combo()
+        self._redraw_plots()
         self.statusMessage.emit(f"Loaded {path}")
 
     # ---------------------------------------------------------- drag & drop

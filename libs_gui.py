@@ -6,7 +6,7 @@ Features:
   - Load one or many spectra (Open, Add, or drag-and-drop files/folders)
   - Single / Waterfall / Working display modes
   - Prev/Next navigation; sum / mean multi-spot shots on the same sample
-  - Quant button: CRM quantification of checked/highlighted spectra (Batch tab)
+  - Quant button: CRM quantification of checked/highlighted spectra → Quant tab
   - Plot full spectrum with detected peaks
   - Run NIST search/match; ranked element list
   - Multi-select elements to preview NIST stick spectra
@@ -18,6 +18,7 @@ Features:
   - Export publication report (≤5 strongest lines per element)
   - Atmosphere tag (air / argon)
   - Calibrate tab: CRM univariate standards calibration (I → C)
+  - Quant tab: results with std/CI, unknown on I→C curve, peak QC, C vs spectrum #
 
 Launch:
   .venv/bin/python libs_gui.py
@@ -31,7 +32,6 @@ libs_gui clears that when possible, and otherwise mirrors Qt plugins to
 
 from __future__ import annotations
 
-import csv
 import os
 import sys
 from dataclasses import dataclass, field
@@ -198,10 +198,12 @@ from PySide6.QtWidgets import (
 )
 
 
+from calibration import QuantSpectrumResult, quantify_spectrum
 from calibration_gui import CalibrationTab
 from identify_elements import (
     ElementHit,
     LibraryLine,
+    Match,
     Peak,
     Spectrum,
     SpectrumMeta,
@@ -226,6 +228,7 @@ from publication_report import (
     export_element_report_pngs,
     plot_element_line_panels,
 )
+from quant_gui import QuantTab
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_LIBRARY = ROOT / "nist_lines" / "libs_line_library.csv"
@@ -408,22 +411,7 @@ class SpectrumMatchCache:
     manual_peaks: list[Peak] = field(default_factory=list)
     peaks: list[Peak] = field(default_factory=list)
     hits: list[ElementHit] = field(default_factory=list)
-
-
-@dataclass
-class BulkQuantRow:
-    index: int  # 1-based spectrum number
-    filename: str
-    concentrations: dict[str, float]  # element -> C
-
-
-class BatchPlotCanvas(FigureCanvasQTAgg):
-    def __init__(self) -> None:
-        apply_matplotlib_config()
-        self.fig = Figure(figsize=(4.5, 3.0), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        super().__init__(self.fig)
-        self.fig.tight_layout()
+    peak_matches: list[Match] = field(default_factory=list)
 
 
 def _paint_icon(size: int, paint) -> QIcon:
@@ -772,12 +760,12 @@ class LibsExplorerWindow(QMainWindow):
         self._display_mode: str = "single"  # single | waterfall | working
         self._waterfall_offset_frac: float = 0.15  # vertical gap as fraction of max intensity
         self._match_cache: dict[str, SpectrumMatchCache] = {}
-        self._bulk_quant_results: list[BulkQuantRow] = []
         self.library: list[LibraryLine] = []
         self.auto_peaks: list[Peak] = []
         self.manual_peaks: list[Peak] = []
         self.peaks: list[Peak] = []  # auto + manual, used for matching
         self.hits: list[ElementHit] = []
+        self.peak_matches: list[Match] = []  # per-peak NIST assignments from Match
         self._selected_wl: float | None = None
         self._selected_elements: list[str] = []
         self._primary_element: str | None = None
@@ -817,19 +805,19 @@ class LibsExplorerWindow(QMainWindow):
         )
         self.act_add_spectra.triggered.connect(self.browse_add_spectra)
 
-        self.act_mean_spectra = QAction("Mean checked spectra", self)
+        self.act_mean_spectra = QAction("Mean selected spectra", self)
         self.act_mean_spectra.setToolTip(
-            "Mean of checked spectra\n"
+            "Mean of selected spectra\n"
             "Average multi-spot shots (recommended when focus/sampling volume varies)."
         )
-        self.act_mean_spectra.triggered.connect(lambda: self.combine_checked_spectra("mean"))
+        self.act_mean_spectra.triggered.connect(lambda: self.combine_selected_spectra("mean"))
 
-        self.act_sum_spectra = QAction("Sum checked spectra", self)
+        self.act_sum_spectra = QAction("Sum selected spectra", self)
         self.act_sum_spectra.setToolTip(
-            "Sum of checked spectra\n"
+            "Sum of selected spectra\n"
             "Add intensities (scales with N; useful to boost weak lines)."
         )
-        self.act_sum_spectra.triggered.connect(lambda: self.combine_checked_spectra("sum"))
+        self.act_sum_spectra.triggered.connect(lambda: self.combine_selected_spectra("sum"))
 
         self.act_export_sum = QAction("Export sum of checked…", self)
         self.act_export_sum.setShortcut(QKeySequence("Ctrl+Shift+S"))
@@ -857,7 +845,7 @@ class LibsExplorerWindow(QMainWindow):
         self.act_bulk_quant = QAction("Quant selected…", self)
         self.act_bulk_quant.setToolTip(
             "Quant selected\nApply Calibrate-tab CRM curves to checked "
-            "(or highlighted) spectra."
+            "(or highlighted) spectra; results open on the Quant tab."
         )
         self.act_bulk_quant.triggered.connect(self.quant_selected_spectra)
 
@@ -899,6 +887,8 @@ class LibsExplorerWindow(QMainWindow):
 
         self.act_calib = QAction("Go to Calibrate tab", self)
         self.act_calib.triggered.connect(self._show_calibrate_tab)
+        self.act_quant = QAction("Go to Quant tab", self)
+        self.act_quant.triggered.connect(self._show_quant_tab)
         self.act_atm = QAction("Atmosphere notes…", self)
         self.act_atm.triggered.connect(
             lambda: QMessageBox.information(self, "Argon atmosphere", ATMOSPHERE_NOTE)
@@ -957,12 +947,18 @@ class LibsExplorerWindow(QMainWindow):
 
         calib_menu = self.menuBar().addMenu("&Calibrate")
         calib_menu.addAction(self.act_calib)
+        calib_menu.addAction(self.act_quant)
+        calib_menu.addAction(self.act_bulk_quant)
         calib_menu.addAction(self.act_atm)
 
     def _show_calibrate_tab(self) -> None:
         if hasattr(self, "tabs"):
             self.tabs.setCurrentWidget(self.calibrate_tab)
             self._sync_calibrate_context()
+
+    def _show_quant_tab(self) -> None:
+        if hasattr(self, "tabs") and hasattr(self, "quant_tab"):
+            self.tabs.setCurrentWidget(self.quant_tab)
 
     @staticmethod
     def _toolbar_group_label(text: str) -> QLabel:
@@ -1146,7 +1142,8 @@ class LibsExplorerWindow(QMainWindow):
         self.spectra_list = QListWidget()
         self.spectra_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.spectra_list.setToolTip(
-            "Check spectra for Mean/Sum, Bulk match, and Quant.\n"
+            "Check spectra for Mean/Sum/View/Remove, Match, and Quant.\n"
+            "Or multi-select rows (Shift/⌘-click) when nothing is checked.\n"
             "Double-click to view one shot (Single mode).\n"
             "Drag-and-drop .txt files or a folder here."
         )
@@ -1170,24 +1167,31 @@ class LibsExplorerWindow(QMainWindow):
         spec_grid.setSpacing(4)
         btn_mean = QPushButton("Mean")
         btn_mean.setToolTip(
-            "Average checked spectra (recommended for multi-spot / focus variation)."
+            "Average all checked spectra (or highlighted rows if none checked)."
         )
-        btn_mean.clicked.connect(lambda: self.combine_checked_spectra("mean"))
+        btn_mean.clicked.connect(lambda: self.combine_selected_spectra("mean"))
         spec_grid.addWidget(btn_mean, 0, 0)
 
         btn_sum = QPushButton("Sum")
-        btn_sum.setToolTip("Sum checked spectra (scales with N).")
-        btn_sum.clicked.connect(lambda: self.combine_checked_spectra("sum"))
+        btn_sum.setToolTip(
+            "Sum all checked spectra (or highlighted rows if none checked)."
+        )
+        btn_sum.clicked.connect(lambda: self.combine_selected_spectra("sum"))
         spec_grid.addWidget(btn_sum, 0, 1)
 
         btn_view = QPushButton("View")
-        btn_view.setToolTip("View highlighted list item in Single mode.")
-        btn_view.clicked.connect(self.activate_highlighted_spectrum)
+        btn_view.setToolTip(
+            "View all checked spectra (or highlighted rows if none checked).\n"
+            "One → Single mode; several → Waterfall."
+        )
+        btn_view.clicked.connect(self.view_selected_spectra)
         spec_grid.addWidget(btn_view, 1, 0)
 
         btn_rm = QPushButton("Remove")
-        btn_rm.setToolTip("Remove highlighted spectra from the list.")
-        btn_rm.clicked.connect(self.remove_highlighted_spectra)
+        btn_rm.setToolTip(
+            "Remove all checked spectra (or highlighted rows if none checked)."
+        )
+        btn_rm.clicked.connect(self.remove_selected_spectra)
         spec_grid.addWidget(btn_rm, 1, 1)
         spectra_layout.addLayout(spec_grid)
 
@@ -1216,7 +1220,8 @@ class LibsExplorerWindow(QMainWindow):
         btn_quant = QPushButton("Quant")
         btn_quant.setToolTip(
             "Quantify checked spectra with Calibrate-tab CRM curves.\n"
-            "If none are checked, uses the highlighted list selection."
+            "If none are checked, uses the highlighted list selection.\n"
+            "Results open on the Quant tab."
         )
         btn_quant.clicked.connect(self.quant_selected_spectra)
         bulk_btns.addWidget(btn_quant)
@@ -1412,38 +1417,6 @@ class LibsExplorerWindow(QMainWindow):
 
         self.side_tabs.addTab(browse_page, "Browse NIST")
 
-        # ---- Batch tab (bulk quant results + C vs spectrum #) ----
-        batch_page = QWidget()
-        batch_layout = QVBoxLayout(batch_page)
-        batch_layout.setContentsMargins(2, 4, 2, 2)
-        self.batch_label = QLabel("Run Quant on selected spectra to fill this table and plot.")
-        self.batch_label.setStyleSheet("color: #555;")
-        self.batch_label.setWordWrap(True)
-        batch_layout.addWidget(self.batch_label)
-
-        batch_plot_row = QHBoxLayout()
-        batch_plot_row.addWidget(QLabel("Plot"))
-        self.combo_batch_el = QComboBox()
-        self.combo_batch_el.setToolTip("Element(s) to show on concentration vs spectrum #")
-        self.combo_batch_el.currentIndexChanged.connect(self._refresh_batch_plot)
-        batch_plot_row.addWidget(self.combo_batch_el, stretch=1)
-        btn_csv = QPushButton("CSV…")
-        btn_csv.setToolTip("Export quant table to CSV")
-        btn_csv.clicked.connect(self.export_bulk_quant_csv)
-        batch_plot_row.addWidget(btn_csv)
-        batch_layout.addLayout(batch_plot_row)
-
-        self.batch_canvas = BatchPlotCanvas()
-        batch_layout.addWidget(self.batch_canvas, stretch=2)
-
-        self.batch_table = QTableWidget(0, 2)
-        self.batch_table.setHorizontalHeaderLabels(["#", "File"])
-        self.batch_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.batch_table.verticalHeader().setVisible(False)
-        self.batch_table.horizontalHeader().setStretchLastSection(True)
-        batch_layout.addWidget(self.batch_table, stretch=2)
-        self.side_tabs.addTab(batch_page, "Batch")
-
         self.side_tabs.currentChanged.connect(self._on_side_tab_changed)
 
         side_layout.addWidget(QLabel("<b>Measurement</b>"))
@@ -1470,6 +1443,12 @@ class LibsExplorerWindow(QMainWindow):
         self.calibrate_tab = CalibrationTab()
         self.calibrate_tab.statusMessage.connect(self.statusBar().showMessage)
         self.tabs.addTab(self.calibrate_tab, "Calibrate")
+
+        # ---- Quant tab ----
+        self.quant_tab = QuantTab()
+        self.quant_tab.statusMessage.connect(self.statusBar().showMessage)
+        self.quant_tab.set_spectrum_resolver(self._spectrum_for_quant_result)
+        self.tabs.addTab(self.quant_tab, "Quant")
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
     # --------------------------------------------------------------- data
@@ -1669,8 +1648,8 @@ class LibsExplorerWindow(QMainWindow):
 
         self._fill_spectra_list(check_all=True)
         self._match_cache.clear()
-        self._bulk_quant_results = []
-        self._refresh_batch_results_ui()
+        if hasattr(self, "quant_tab"):
+            self.quant_tab.clear_results()
 
         self._spectrum_index = 0
         self._set_display_mode("single", redraw=False)
@@ -1685,7 +1664,7 @@ class LibsExplorerWindow(QMainWindow):
         else:
             self.statusBar().showMessage(
                 f"Loaded {n} spectra — use Prev/Next, Waterfall, Mean/Sum, "
-                "or Bulk match/quant on checked files."
+                "or Match/Quant on checked files."
             )
 
     def _fill_spectra_list(self, *, check_all: bool = False) -> None:
@@ -1855,37 +1834,41 @@ class LibsExplorerWindow(QMainWindow):
             self.spectra_list.setCurrentRow(index)
             self.spectra_list.blockSignals(False)
 
-    def combine_checked_spectra(self, mode: str = "mean", *, reset_view: bool = False) -> None:
-        checked = self._checked_spectra()
-        if not checked:
+    def combine_selected_spectra(self, mode: str = "mean", *, reset_view: bool = False) -> None:
+        selected = self._spectra_for_list_actions()
+        if not selected:
             QMessageBox.information(
                 self,
-                "No spectra checked",
-                "Check one or more spectra in the list, then Mean or Sum.",
+                "No spectra selected",
+                "Check one or more spectra in the list (or highlight rows), then Mean or Sum.",
             )
             return
-        if len(checked) == 1:
+        if len(selected) == 1:
             # Jump to that file in Single mode
             try:
-                idx = self.loaded_spectra.index(checked[0])
+                idx = self.loaded_spectra.index(selected[0])
             except ValueError:
                 idx = 0
             self._activate_loaded_at_index(idx, restore_cache=True, reset_view=reset_view)
-            self.statusBar().showMessage(f"Working spectrum: {checked[0].meta.path.name}")
+            self.statusBar().showMessage(f"Working spectrum: {selected[0].meta.path.name}")
             return
         try:
-            combined = combine_spectra(checked, mode=mode)
+            combined = combine_spectra(selected, mode=mode)
         except Exception as exc:
             QMessageBox.critical(self, "Combine failed", str(exc))
             return
         combined = self._register_combined_spectrum(
             combined, activate=True, reset_view=reset_view
         )
-        names = ", ".join(s.meta.path.stem for s in checked[:6])
-        more = f" +{len(checked) - 6}" if len(checked) > 6 else ""
+        names = ", ".join(s.meta.path.stem for s in selected[:6])
+        more = f" +{len(selected) - 6}" if len(selected) > 6 else ""
         self.statusBar().showMessage(
             f"Added {combined.meta.path.name} to list ({names}{more})"
         )
+
+    def combine_checked_spectra(self, mode: str = "mean", *, reset_view: bool = False) -> None:
+        """Backward-compatible alias for Mean/Sum."""
+        self.combine_selected_spectra(mode, reset_view=reset_view)
 
     def _unique_spectrum_path(self, preferred: Path) -> Path:
         """Pick a list name that does not collide with already-loaded spectra."""
@@ -1978,12 +1961,12 @@ class LibsExplorerWindow(QMainWindow):
         QMessageBox.information(self, "Spectrum exported", msg)
 
     def export_combined_spectra(self, mode: str = "sum") -> None:
-        """Combine checked spectra (sum/mean) and write a .txt file."""
-        checked = self._checked_spectra()
+        """Combine selected spectra (sum/mean) and write a .txt file."""
+        checked = self._spectra_for_list_actions()
         if not checked:
             QMessageBox.information(
                 self,
-                "No spectra checked",
+                "No spectra selected",
                 "Check one or more spectra in the list, then Export sum…",
             )
             return
@@ -2032,15 +2015,63 @@ class LibsExplorerWindow(QMainWindow):
         self.statusBar().showMessage(msg)
         QMessageBox.information(self, "Spectrum exported", msg)
 
-    def activate_highlighted_spectrum(self) -> None:
-        row = self.spectra_list.currentRow()
-        if row < 0:
-            QMessageBox.information(self, "Nothing selected", "Highlight a spectrum in the list.")
+    def view_selected_spectra(self) -> None:
+        """View all selected spectra: one → Single; several → Waterfall."""
+        selected = self._spectra_for_list_actions()
+        if not selected:
+            QMessageBox.information(
+                self,
+                "Nothing selected",
+                "Check one or more spectra (or highlight rows), then View.",
+            )
             return
-        self._activate_loaded_at_index(row, restore_cache=True, reset_view=False)
+        if len(selected) == 1:
+            try:
+                idx = self.loaded_spectra.index(selected[0])
+            except ValueError:
+                idx = 0
+            self._activate_loaded_at_index(idx, restore_cache=True, reset_view=False)
+            self.statusBar().showMessage(
+                f"Viewing: {selected[0].meta.path.name}"
+            )
+            return
+
+        # Multiple: check exactly these so Waterfall shows the selection
+        wanted = {str(s.meta.path.resolve()) for s in selected}
+        if hasattr(self, "spectra_list"):
+            self.spectra_list.blockSignals(True)
+            for i in range(self.spectra_list.count()):
+                item = self.spectra_list.item(i)
+                if item is None:
+                    continue
+                raw = item.data(Qt.ItemDataRole.UserRole)
+                path_key = ""
+                if raw:
+                    try:
+                        path_key = str(Path(raw).resolve())
+                    except Exception:
+                        path_key = ""
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if path_key in wanted
+                    else Qt.CheckState.Unchecked
+                )
+            self.spectra_list.blockSignals(False)
+
+        try:
+            idx = self.loaded_spectra.index(selected[0])
+            self._spectrum_index = idx
+        except ValueError:
+            pass
+        self._set_display_mode("waterfall", redraw=True)
         self.statusBar().showMessage(
-            f"Working spectrum: {self.loaded_spectra[row].meta.path.name}"
+            f"Waterfall — {len(selected)} selected spectrum"
+            f"{'a' if len(selected) != 1 else ''}."
         )
+
+    def activate_highlighted_spectrum(self) -> None:
+        """Backward-compatible alias for View."""
+        self.view_selected_spectra()
 
     def _on_spectrum_item_activated(self, item: QListWidgetItem) -> None:
         row = self.spectra_list.row(item)
@@ -2076,16 +2107,17 @@ class LibsExplorerWindow(QMainWindow):
     def deselect_all_spectra(self) -> None:
         self._set_all_spectra_checked(False)
 
-    def remove_highlighted_spectra(self) -> None:
-        items = self.spectra_list.selectedItems()
-        if not items:
-            QMessageBox.information(self, "Nothing selected", "Highlight spectra to remove.")
+    def remove_selected_spectra(self) -> None:
+        selected = self._spectra_for_list_actions()
+        if not selected:
+            QMessageBox.information(
+                self,
+                "Nothing selected",
+                "Check spectra to remove (or highlight rows), then Remove.",
+            )
             return
-        remove_paths = set()
-        for it in items:
-            raw = it.data(Qt.ItemDataRole.UserRole)
-            if raw:
-                remove_paths.add(str(Path(raw).resolve()))
+        remove_paths = {str(s.meta.path.resolve()) for s in selected}
+        n_rm = len(remove_paths)
         self.loaded_spectra = [
             s for s in self.loaded_spectra if str(s.meta.path.resolve()) not in remove_paths
         ]
@@ -2101,6 +2133,7 @@ class LibsExplorerWindow(QMainWindow):
             self.manual_peaks = []
             self.peaks = []
             self.hits = []
+            self.peak_matches = []
             self._update_working_label()
             self._fill_element_table()
             self._clear_table(self.cand_table)
@@ -2112,6 +2145,14 @@ class LibsExplorerWindow(QMainWindow):
         self._activate_loaded_at_index(
             self._spectrum_index, restore_cache=True, reset_view=False
         )
+        self.statusBar().showMessage(
+            f"Removed {n_rm} spectrum{'a' if n_rm != 1 else ''} "
+            f"({len(self.loaded_spectra)} remaining)."
+        )
+
+    def remove_highlighted_spectra(self) -> None:
+        """Backward-compatible alias for Remove."""
+        self.remove_selected_spectra()
 
     def _cache_key_for_spectrum(self, spectrum: Spectrum | None = None) -> str | None:
         spec = spectrum if spectrum is not None else self.spectrum
@@ -2132,6 +2173,7 @@ class LibsExplorerWindow(QMainWindow):
             manual_peaks=list(self.manual_peaks),
             peaks=list(self.peaks),
             hits=list(self.hits),
+            peak_matches=list(self.peak_matches),
         )
         self._fill_spectra_list(check_all=False)
 
@@ -2143,6 +2185,7 @@ class LibsExplorerWindow(QMainWindow):
         self.manual_peaks = list(cached.manual_peaks)
         self.peaks = list(cached.peaks)
         self.hits = list(cached.hits)
+        self.peak_matches = list(getattr(cached, "peak_matches", []) or [])
         self._pin_matched_elements()
         return True
 
@@ -2171,6 +2214,7 @@ class LibsExplorerWindow(QMainWindow):
             self.manual_peaks = []
             self.peaks = []
             self.hits = []
+            self.peak_matches = []
         self._sync_periodic_pins()
 
         self._update_working_label()
@@ -2271,6 +2315,7 @@ class LibsExplorerWindow(QMainWindow):
         self.peaks = merge_peaks(self.auto_peaks, self.manual_peaks)
         if not self.library:
             self.hits = []
+            self.peak_matches = []
             self._fill_element_table()
             self._redraw(reset_view=False)
             return
@@ -2278,6 +2323,7 @@ class LibsExplorerWindow(QMainWindow):
             tol = float(self.spin_tol.value())
         if not self.peaks:
             self.hits = []
+            self.peak_matches = []
         else:
             support: dict[str, float] = {}
             primary: dict[str, bool] = {}
@@ -2290,6 +2336,7 @@ class LibsExplorerWindow(QMainWindow):
                 primary_diagnostic_out=primary,
                 primary_wavelength_out=primary_wl,
             )
+            self.peak_matches = list(matches)
             self.hits = score_elements(
                 matches,
                 min_peaks=2,
@@ -2375,6 +2422,7 @@ class LibsExplorerWindow(QMainWindow):
                     primary_wavelength=primary_wl,
                 )
             else:
+                matches = []
                 hits = []
             key = spec.meta.path.name
             self._match_cache[key] = SpectrumMatchCache(
@@ -2382,6 +2430,7 @@ class LibsExplorerWindow(QMainWindow):
                 manual_peaks=[],
                 peaks=list(peaks),
                 hits=list(hits),
+                peak_matches=list(matches),
             )
             n_ok += 1
 
@@ -2434,15 +2483,23 @@ class LibsExplorerWindow(QMainWindow):
                 out.append(spec)
         return out
 
-    def _spectra_for_quant(self) -> list[Spectrum]:
-        """Checked spectra if any; otherwise highlighted list selection."""
+    def _spectra_for_list_actions(self) -> list[Spectrum]:
+        """Spectra for Mean / Sum / View / Remove.
+
+        Prefer checked boxes (Select all / Deselect all); if none are checked,
+        use highlighted list rows (Shift/⌘ multi-select).
+        """
         checked = self._checked_spectra()
         if checked:
             return checked
         return self._highlighted_spectra()
 
+    def _spectra_for_quant(self) -> list[Spectrum]:
+        """Checked spectra if any; otherwise highlighted list selection."""
+        return self._spectra_for_list_actions()
+
     def quant_selected_spectra(self) -> None:
-        """Apply Calibrate-tab CRM fits to each selected spectrum."""
+        """Apply Calibrate-tab CRM fits to each selected spectrum; open Quant tab."""
         targets = self._spectra_for_quant()
         if not targets:
             QMessageBox.information(
@@ -2460,7 +2517,10 @@ class LibsExplorerWindow(QMainWindow):
             )
             return
 
-        rows: list[BulkQuantRow] = []
+        self.calibrate_tab._sync_params_from_ui()
+        cal = self.calibrate_tab.cal
+        unit = self.calibrate_tab.concentration_unit()
+        results = []
         errors: list[str] = []
         for i, spec in enumerate(targets):
             self.statusBar().showMessage(
@@ -2468,28 +2528,18 @@ class LibsExplorerWindow(QMainWindow):
             )
             QApplication.processEvents()
             try:
-                preds = self.calibrate_tab.predict_for_spectrum(spec)
-            except Exception as exc:
-                errors.append(f"{spec.meta.path.name}: {exc}")
-                continue
-            try:
                 idx = self.loaded_spectra.index(spec) + 1
             except ValueError:
                 idx = i + 1
-            conc = {p.element: float(p.concentration) for p in preds}
-            rows.append(
-                BulkQuantRow(index=idx, filename=spec.meta.path.name, concentrations=conc)
-            )
+            try:
+                results.append(quantify_spectrum(cal, spec, index=idx))
+            except Exception as exc:
+                errors.append(f"{spec.meta.path.name}: {exc}")
 
-        self._bulk_quant_results = rows
-        self._refresh_batch_results_ui()
-        if hasattr(self, "side_tabs"):
-            for ti in range(self.side_tabs.count()):
-                if self.side_tabs.tabText(ti) == "Batch":
-                    self.side_tabs.setCurrentIndex(ti)
-                    break
+        self.quant_tab.set_results(results, cal, unit=unit)
+        self.tabs.setCurrentWidget(self.quant_tab)
 
-        msg = f"Quant done — {len(rows)} spectrum{'a' if len(rows) != 1 else ''}."
+        msg = f"Quant done — {len(results)} spectrum{'a' if len(results) != 1 else ''}."
         if errors:
             msg += f" {len(errors)} failed."
             QMessageBox.warning(
@@ -2503,153 +2553,20 @@ class LibsExplorerWindow(QMainWindow):
         """Backward-compatible alias for Quant."""
         self.quant_selected_spectra()
 
-    def _refresh_batch_results_ui(self) -> None:
-        if not hasattr(self, "batch_table"):
-            return
-        rows = self._bulk_quant_results
-        elements: list[str] = []
-        seen: set[str] = set()
-        for r in rows:
-            for el in r.concentrations:
-                if el not in seen:
-                    seen.add(el)
-                    elements.append(el)
-        if not elements and hasattr(self, "calibrate_tab"):
-            elements = list(self.calibrate_tab.active_quant_elements())
-
-        headers = ["#", "File"] + elements
-        self.batch_table.setColumnCount(len(headers))
-        self.batch_table.setHorizontalHeaderLabels(headers)
-        self.batch_table.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            self.batch_table.setItem(i, 0, QTableWidgetItem(str(r.index)))
-            self.batch_table.setItem(i, 1, QTableWidgetItem(r.filename))
-            for j, el in enumerate(elements):
-                c = r.concentrations.get(el)
-                text = f"{c:.4g}" if c is not None else ""
-                self.batch_table.setItem(i, 2 + j, QTableWidgetItem(text))
-        self.batch_table.resizeColumnsToContents()
-
-        if hasattr(self, "batch_label"):
-            if rows:
-                unit = ""
-                if hasattr(self, "calibrate_tab"):
-                    unit = self.calibrate_tab.concentration_unit()
-                unit_txt = f" ({unit})" if unit else ""
-                self.batch_label.setText(
-                    f"{len(rows)} spectra quantified · {len(elements)} element(s)"
-                    f"{unit_txt}. "
-                    "Plot concentration vs spectrum # below."
-                )
-            else:
-                self.batch_label.setText("Run Quant on selected spectra to fill this table and plot.")
-
-        if hasattr(self, "combo_batch_el"):
-            self.combo_batch_el.blockSignals(True)
-            self.combo_batch_el.clear()
-            if elements:
-                self.combo_batch_el.addItem("All (≤4)", "__all__")
-                for el in elements:
-                    self.combo_batch_el.addItem(el, el)
-            self.combo_batch_el.blockSignals(False)
-
-        self._refresh_batch_plot()
-
-    def _refresh_batch_plot(self, _index: int = 0) -> None:
-        if not hasattr(self, "batch_canvas"):
-            return
-        ax = self.batch_canvas.ax
-        ax.clear()
-        rows = self._bulk_quant_results
-        if not rows:
-            ax.text(
-                0.5,
-                0.5,
-                "No bulk quant results",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color="#777",
-            )
-            self.batch_canvas.fig.tight_layout()
-            self.batch_canvas.draw_idle()
-            return
-
-        elements: list[str] = []
-        seen: set[str] = set()
-        for r in rows:
-            for el in r.concentrations:
-                if el not in seen:
-                    seen.add(el)
-                    elements.append(el)
-
-        choice = self.combo_batch_el.currentData() if hasattr(self, "combo_batch_el") else None
-        if choice == "__all__" or choice is None:
-            plot_els = elements[:4]
-        else:
-            plot_els = [str(choice)]
-
-        xs = [r.index for r in rows]
-        for i, el in enumerate(plot_els):
-            ys = [r.concentrations.get(el, np.nan) for r in rows]
-            color = ELEMENT_COLORS[i % len(ELEMENT_COLORS)]
-            ax.plot(xs, ys, "o-", color=color, lw=1.2, ms=5, label=el)
-
-        ax.set_xlabel("Spectrum #")
-        unit = ""
-        if hasattr(self, "calibrate_tab"):
-            unit = self.calibrate_tab.concentration_unit()
-        ax.set_ylabel(f"Concentration ({unit})" if unit else "Concentration")
-        ax.set_title("C vs spectrum index")
-        ax.grid(True, alpha=0.3)
-        if plot_els:
-            ax.legend(fontsize=8, framealpha=0.9)
-        if xs:
-            ax.set_xticks(xs)
-        self.batch_canvas.fig.tight_layout()
-        self.batch_canvas.draw_idle()
-
-    def export_bulk_quant_csv(self) -> None:
-        rows = self._bulk_quant_results
-        if not rows:
-            QMessageBox.information(self, "Nothing to export", "Run Quant first.")
-            return
-        elements: list[str] = []
-        seen: set[str] = set()
-        for r in rows:
-            for el in r.concentrations:
-                if el not in seen:
-                    seen.add(el)
-                    elements.append(el)
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export quant CSV",
-            str(ROOT / "reports" / "bulk_quant.csv"),
-            "CSV (*.csv);;All files (*)",
-        )
-        if not path:
-            return
-        unit = ""
-        if hasattr(self, "calibrate_tab"):
-            unit = self.calibrate_tab.concentration_unit()
-        headers = ["index", "filename"] + [
-            f"{el}_{unit}" if unit else el for el in elements
-        ]
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(headers)
-            for r in rows:
-                w.writerow(
-                    [
-                        r.index,
-                        r.filename,
-                        *[
-                            f"{r.concentrations[el]:.6g}" if el in r.concentrations else ""
-                            for el in elements
-                        ],
-                    ]
-                )
-        self.statusBar().showMessage(f"Exported quant → {path}")
+    def _spectrum_for_quant_result(self, row: QuantSpectrumResult) -> Spectrum | None:
+        """Resolve a loaded spectrum for a Quant result row."""
+        if row.spectrum_path:
+            for s in self.loaded_spectra:
+                if str(s.meta.path) == row.spectrum_path:
+                    return s
+        if 1 <= row.index <= len(self.loaded_spectra):
+            s = self.loaded_spectra[row.index - 1]
+            if s.meta.path.name == row.filename:
+                return s
+        for s in self.loaded_spectra:
+            if s.meta.path.name == row.filename:
+                return s
+        return None
 
     def add_peak_at_selection(self) -> None:
         """Add a manual peak at the blue selection line (or warn if none)."""
@@ -3747,9 +3664,33 @@ class LibsExplorerWindow(QMainWindow):
         query_wl = peak.wavelength_nm if peak is not None else wavelength_nm
         self._selected_wl = query_wl
 
-        cands = candidates_near_wavelength(query_wl, self.library, tol_nm=tol, max_results=40)
+        prefer_el: str | None = None
+        prefer_wl: float | None = None
+        matched = self._peak_match_at(query_wl)
+        if matched is not None:
+            prefer_el = matched.line.element
+            prefer_wl = matched.line.wavelength_nm
+
+        cands = candidates_near_wavelength(
+            query_wl,
+            self.library,
+            tol_nm=tol,
+            max_results=40,
+            prefer_element=prefer_el,
+            prefer_wavelength_nm=prefer_wl,
+        )
         self.side_tabs.setCurrentIndex(0)
-        self.cand_label.setText("<b>Peak candidates (click plot)</b>")
+        if prefer_el:
+            self.cand_label.setText(
+                f"<b>Peak candidates</b> "
+                f"<span style='color:#666;font-weight:normal'>"
+                f"(Match: {matched.line.species} first, then strongest)</span>"
+            )
+        else:
+            self.cand_label.setText(
+                "<b>Peak candidates (click plot)</b> "
+                "<span style='color:#666;font-weight:normal'>(strongest first)</span>"
+            )
         self._clear_table(self.cand_table)
         self.cand_table.setRowCount(len(cands))
         for i, c in enumerate(cands):
@@ -3763,21 +3704,50 @@ class LibsExplorerWindow(QMainWindow):
                 aki,
             )
             for j, v in enumerate(vals):
-                self.cand_table.setItem(i, j, QTableWidgetItem(v))
+                item = QTableWidgetItem(v)
+                # Emphasize Match assignment / preferred element
+                if prefer_wl is not None and abs(c.line.wavelength_nm - prefer_wl) < 1e-3:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                elif prefer_el is not None and c.line.element == prefer_el:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                self.cand_table.setItem(i, j, item)
         self.cand_table.resizeColumnsToContents()
         self._redraw(reset_view=False)
 
         if peak is not None:
             tag = "manual" if peak.manual else "auto"
+            match_note = (
+                f" · Match={matched.line.species}" if matched is not None else ""
+            )
             self.statusBar().showMessage(
                 f"Peak {peak.wavelength_nm:.3f} nm [{tag}] (I={peak.intensity:.0f}) — "
-                f"{len(cands)} candidates within ±{tol:.2f} nm"
+                f"{len(cands)} candidates within ±{tol:.2f} nm{match_note}"
             )
         else:
             self.statusBar().showMessage(
                 f"λ = {query_wl:.3f} nm — {len(cands)} candidates within ±{tol:.2f} nm "
                 f"(no peak nearby; Shift/right-click to add)"
             )
+
+    def _peak_match_at(self, wavelength_nm: float) -> Match | None:
+        """Return the Match assignment for the peak at / nearest this wavelength."""
+        if not self.peak_matches:
+            return None
+        best: Match | None = None
+        best_d = 1e9
+        for m in self.peak_matches:
+            d = abs(m.peak.wavelength_nm - wavelength_nm)
+            if d < best_d:
+                best_d = d
+                best = m
+        # Same peak (float equality / tiny offset after click snap)
+        if best is not None and best_d <= 0.05:
+            return best
+        return None
 
     def clear_selection(self) -> None:
         self._selected_wl = None

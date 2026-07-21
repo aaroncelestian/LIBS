@@ -462,6 +462,38 @@ def _has_nearby_peak(
     return False
 
 
+def match_library_lines(
+    library: list[LibraryLine],
+    *,
+    wl_min: float,
+    wl_max: float,
+    max_per_element: int = 10,
+    libs_diagnostics: bool = True,
+) -> list[LibraryLine]:
+    """
+    Subset of ``library`` used for peak→line assignment.
+
+    Keeps only the top ``max_per_element`` LIBS diagnostics per element
+    (see ``strong_library_lines(..., libs_diagnostics=True)``). Browse /
+    click-inspect should keep using the full NIST catalog.
+    """
+    if not library or max_per_element <= 0:
+        return []
+    elements = sorted({L.element for L in library if L.element})
+    strong = strong_library_lines(
+        library,
+        elements,
+        wl_min=wl_min,
+        wl_max=wl_max,
+        max_per_element=max_per_element,
+        libs_diagnostics=libs_diagnostics,
+    )
+    out: list[LibraryLine] = []
+    for lines in strong.values():
+        out.extend(lines)
+    return out
+
+
 def element_diagnostic_support(
     peaks: list[Peak],
     library: list[LibraryLine],
@@ -534,12 +566,19 @@ def match_peaks(
     use_diagnostic_prior: bool = True,
     diagnostic_tol_nm: float | None = None,
     n_diagnostics: int = 5,
+    match_max_per_element: int | None = 10,
+    match_libs_diagnostics: bool = True,
     diagnostic_support_out: dict[str, float] | None = None,
     primary_diagnostic_out: dict[str, bool] | None = None,
     primary_wavelength_out: dict[str, float] | None = None,
 ) -> list[Match]:
     """
     Assign each peak to the best nearby NIST line (Δλ + NIST intensity).
+
+    By default only each element's top ``match_max_per_element`` LIBS
+    diagnostics are considered (``libs_diagnostics`` ranking). Pass
+    ``match_max_per_element=None`` to search the full library. Browse NIST
+    should keep using the unfiltered catalog.
 
     When ``use_diagnostic_prior`` is True (default), candidates from elements
     whose strongest diagnostic lines are missing from the spectrum are
@@ -561,10 +600,26 @@ def match_peaks(
             primary_wavelength_out.clear()
         return []
 
-    lib_wl = np.array([L.wavelength_nm for L in library])
+    peak_span_lo = min(p.wavelength_nm for p in peaks) - 1.0
+    peak_span_hi = max(p.wavelength_nm for p in peaks) + 1.0
+
+    # Restrict assignment to top-N LIBS diagnostics (Browse stays on full library).
+    match_lib = library
+    if match_max_per_element is not None:
+        match_lib = match_library_lines(
+            library,
+            wl_min=peak_span_lo,
+            wl_max=peak_span_hi,
+            max_per_element=int(match_max_per_element),
+            libs_diagnostics=match_libs_diagnostics,
+        )
+        if not match_lib:
+            match_lib = library
+
+    lib_wl = np.array([L.wavelength_nm for L in match_lib])
     order = np.argsort(lib_wl)
     lib_wl_sorted = lib_wl[order]
-    lib_sorted = [library[i] for i in order]
+    lib_sorted = [match_lib[i] for i in order]
 
     support: dict[str, float] = {}
     primary: dict[str, bool] = {}
@@ -576,25 +631,30 @@ def match_peaks(
         d_tol = float(diagnostic_tol_nm) if diagnostic_tol_nm is not None else min(
             max(tol_nm, 0.08), 0.10
         )
+        # Support / primary gates use the full library's diagnostic ranking so
+        # presence tests stay consistent even when assignment is top-N only.
         support = element_diagnostic_support(
             peaks,
             library,
+            wl_min=peak_span_lo,
+            wl_max=peak_span_hi,
             tol_nm=d_tol,
             n_diagnostics=n_diagnostics,
             primary_out=primary,
             primary_wavelength_out=primary_wl,
         )
-        # Remember top diagnostic wavelengths so a contested peak that *is*
-        # one of an element's strongest lines still gets fair weight.
-        peak_span_lo = min(p.wavelength_nm for p in peaks) - 1.0
-        peak_span_hi = max(p.wavelength_nm for p in peaks) + 1.0
+        # Soft Δλ boost for lines in the match (top-N) set.
         strong = strong_library_lines(
             library,
             sorted(support.keys()),
             wl_min=peak_span_lo,
             wl_max=peak_span_hi,
-            max_per_element=n_diagnostics,
-            libs_diagnostics=True,
+            max_per_element=(
+                int(match_max_per_element)
+                if match_max_per_element is not None
+                else n_diagnostics
+            ),
+            libs_diagnostics=match_libs_diagnostics,
         )
         for el, lines in strong.items():
             top_diag_wls[el] = {round(L.wavelength_nm, 4) for L in lines}
@@ -897,8 +957,17 @@ def candidates_near_wavelength(
     *,
     tol_nm: float = 0.15,
     max_results: int = 25,
+    prefer_element: str | None = None,
+    prefer_wavelength_nm: float | None = None,
 ) -> list[Candidate]:
-    """Return ranked NIST lines near a clicked wavelength."""
+    """
+    Return NIST lines near a clicked wavelength.
+
+    Sort order:
+      1. Exact Match assignment (``prefer_wavelength_nm``), if any
+      2. Other lines from the matched element (``prefer_element``)
+      3. Remaining lines by strongest NIST intensity, then smallest |Δλ|
+    """
     if not library:
         return []
 
@@ -910,6 +979,8 @@ def candidates_near_wavelength(
     lo = int(np.searchsorted(lib_wl_sorted, wavelength_nm - tol_nm))
     hi = int(np.searchsorted(lib_wl_sorted, wavelength_nm + tol_nm))
 
+    prefer_el = (prefer_element or "").strip() or None
+
     cands: list[Candidate] = []
     for k in range(lo, hi):
         line = lib_sorted[k]
@@ -919,10 +990,26 @@ def candidates_near_wavelength(
             strength += line.intensity
         if line.aki is not None and line.aki > 0:
             strength += min(line.aki / 1e6, 5e4)
+        # Keep score for callers that still use it; primary ordering is below.
         score = (abs(d) / 0.05) ** 2 - 0.45 * np.log10(strength)
         cands.append(Candidate(line=line, delta_nm=d, score=float(score)))
 
-    cands.sort(key=lambda c: c.score)
+    def _sort_key(c: Candidate) -> tuple:
+        is_exact = (
+            prefer_wavelength_nm is not None
+            and abs(c.line.wavelength_nm - prefer_wavelength_nm) < 1e-3
+        )
+        is_pref_el = prefer_el is not None and c.line.element == prefer_el
+        if is_exact:
+            pref_rank = 0
+        elif is_pref_el:
+            pref_rank = 1
+        else:
+            pref_rank = 2
+        inten = c.line.intensity if c.line.intensity is not None else -1.0
+        return (pref_rank, -float(inten), abs(c.delta_nm))
+
+    cands.sort(key=_sort_key)
     return cands[:max_results]
 
 

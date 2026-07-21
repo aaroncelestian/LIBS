@@ -4,7 +4,7 @@ CRM univariate LIBS calibration.
 Workflow:
   1. Load standard spectra (+ optional .cfg)
   2. Enter known concentrations for elements of interest
-  3. Local baseline subtract + integrate diagnostic lines
+  3. Local baseline + Gaussian/Voigt peak fit (with λ shift) or net area
   4. Soft-flag overlapping NIST neighbors
   5. Fit intensity → concentration curves (linear / optional quadratic)
   6. Apply to an unknown spectrum (multi-line average)
@@ -77,6 +77,52 @@ class ElementPrediction:
 
 
 @dataclass
+class QuantSpectrumResult:
+    """One unknown spectrum after applying CRM fits."""
+
+    index: int  # 1-based spectrum number (display / series axis)
+    filename: str
+    spectrum_path: str
+    predictions: list[ElementPrediction]
+    #: (element, wavelength_nm) → measured peak intensity used for I→C
+    line_intensities: dict[tuple[str, float], float] = field(default_factory=dict)
+
+    def prediction_for(self, element: str) -> ElementPrediction | None:
+        for p in self.predictions:
+            if p.element == element:
+                return p
+        return None
+
+    def concentrations(self) -> dict[str, float]:
+        return {p.element: float(p.concentration) for p in self.predictions}
+
+
+def confidence_interval_95(
+    mean: float,
+    std: float | None,
+    n: int,
+) -> tuple[float, float] | None:
+    """
+    Two-sided 95% CI for the mean from sample std: mean ± t * std / √n.
+
+    Returns None when ``n < 2`` or ``std`` is missing/non-finite.
+    """
+    if n < 2 or std is None:
+        return None
+    try:
+        s = float(std)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(s) or s < 0.0 or not np.isfinite(mean):
+        return None
+    from scipy.stats import t as student_t
+
+    tcrit = float(student_t.ppf(0.975, n - 1))
+    half = tcrit * s / np.sqrt(n)
+    return float(mean - half), float(mean + half)
+
+
+@dataclass
 class CalibrationSet:
     """In-memory calibration session."""
 
@@ -86,14 +132,20 @@ class CalibrationSet:
     #: Empty means “all of ``elements``”.
     quantify_elements: list[str] = field(default_factory=list)
     diagnostic_lines: list[DiagnosticLine] = field(default_factory=list)
-    half_width_nm: float = 0.20
-    baseline_pad_nm: float = 0.40
+    half_width_nm: float = 0.15
+    baseline_pad_nm: float = 0.12
+    #: ``linear`` (edge-to-edge tilt) or ``flat`` (constant from edge strips)
+    baseline_method: str = "linear"
+    #: Peak intensity model: ``gaussian`` (default), ``voigt``, or ``net_area``
+    peak_model: str = "gaussian"
+    #: Allowed |fitted − NIST| shift when peak_model is gaussian/voigt
+    shift_tol_nm: float = 0.15
     overlap_tol_nm: float = 0.12
     fit_degree: int = 1
     min_standards: int = 2
     atmosphere: str = "unknown"
-    #: Label for concentration values (e.g. "wt%", "ppm"). Metadata only —
-    #: the fit does not convert units; keep CRM and unknown reporting consistent.
+    #: Concentration unit for CRM entry and predictions (e.g. "wt%", "ppm").
+    #: Convertible mass units are scaled when the user changes the unit in the UI.
     concentration_unit: str = "wt%"
     fits: list[CurveFit] = field(default_factory=list)
 
@@ -106,8 +158,161 @@ class CalibrationSet:
 
 
 # ---------------------------------------------------------------------------
+# Concentration units
+# ---------------------------------------------------------------------------
+
+# Display labels for the unit combo (order shown in UI).
+CONCENTRATION_UNIT_CHOICES: tuple[str, ...] = (
+    "wt%",
+    "ppm",
+    "mg/kg",
+    "µg/g",
+    "mass frac",
+    "at%",
+    "oxide wt%",
+)
+
+# Factors to absolute mass fraction (0–1). Same physical quantity ↔ convertible.
+_MASS_FRAC_PER_UNIT: dict[str, float] = {
+    "wt%": 1e-2,
+    "ppm": 1e-6,
+    "mg/kg": 1e-6,
+    "µg/g": 1e-6,
+    "ug/g": 1e-6,
+    "mass frac": 1.0,
+    "mass fraction": 1.0,
+    "frac": 1.0,
+}
+
+
+def normalize_concentration_unit(unit: str) -> str:
+    """Canonical unit label for comparisons."""
+    u = (unit or "").strip()
+    aliases = {
+        "wt %": "wt%",
+        "weight %": "wt%",
+        "weight%": "wt%",
+        "mass%": "wt%",
+        "ug/g": "µg/g",
+        "ppm (µg/g)": "ppm",
+        "ppm (mg/kg)": "ppm",
+        "mass fraction": "mass frac",
+        "fraction": "mass frac",
+    }
+    for a, canon in aliases.items():
+        if u.lower() == a.lower():
+            return canon
+    for choice in CONCENTRATION_UNIT_CHOICES:
+        if u.lower() == choice.lower():
+            return choice
+    return u or "wt%"
+
+
+def concentration_units_convertible(unit_a: str, unit_b: str) -> bool:
+    """True if both units are mass-based and can be linearly converted."""
+
+    def factor_key(u: str) -> str | None:
+        n = normalize_concentration_unit(u)
+        for k in _MASS_FRAC_PER_UNIT:
+            if k.lower() == n.lower():
+                return k
+        return None
+
+    return factor_key(unit_a) is not None and factor_key(unit_b) is not None
+
+
+def convert_concentration(
+    value: float,
+    from_unit: str,
+    to_unit: str,
+) -> float:
+    """
+    Convert a concentration between mass-based units.
+
+    Raises ``ValueError`` if either unit is not mass-convertible (e.g. at%).
+    """
+    if not concentration_units_convertible(from_unit, to_unit):
+        raise ValueError(
+            f"Cannot convert between {from_unit!r} and {to_unit!r} "
+            "(only wt%, ppm, mg/kg, µg/g, mass frac)."
+        )
+    fu = normalize_concentration_unit(from_unit)
+    tu = normalize_concentration_unit(to_unit)
+    if fu.lower() == tu.lower():
+        return float(value)
+
+    def factor(u: str) -> float:
+        n = normalize_concentration_unit(u)
+        for k, f in _MASS_FRAC_PER_UNIT.items():
+            if k.lower() == n.lower():
+                return f
+        raise ValueError(u)
+
+    mass_frac = float(value) * factor(fu)
+    return mass_frac / factor(tu)
+
+
+def convert_calibration_concentrations(
+    cal: CalibrationSet,
+    from_unit: str,
+    to_unit: str,
+) -> int:
+    """
+    In-place convert every standard concentration from ``from_unit`` to ``to_unit``.
+
+    Returns the number of values converted. No-op (returns 0) if units match
+    or are not convertible.
+    """
+    if normalize_concentration_unit(from_unit).lower() == normalize_concentration_unit(
+        to_unit
+    ).lower():
+        return 0
+    if not concentration_units_convertible(from_unit, to_unit):
+        return 0
+    n = 0
+    for std in cal.standards:
+        for el, val in list(std.concentrations.items()):
+            if val is None:
+                continue
+            std.concentrations[el] = convert_concentration(float(val), from_unit, to_unit)
+            n += 1
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Signal extraction
 # ---------------------------------------------------------------------------
+
+BASELINE_METHODS: tuple[str, ...] = ("linear", "flat")
+
+
+def _window_bounds(
+    center_nm: float,
+    half_width_nm: float,
+    pad_nm: float,
+    *,
+    edge_frac: float = 0.40,
+) -> tuple[float, float, float, float, float, float]:
+    """
+    Return ``(lo, hi, edge_w, integrate_lo, integrate_hi, edge_frac_clamped)``.
+
+    Layout (wavelength increasing)::
+
+        |--edge--|-- pad remnant + half_width (×2) --|--edge--|
+        lo                                              hi
+
+    Net area is integrated between the edge strips (``integrate_lo`` …
+    ``integrate_hi``), so peak shoulders that sit in the pad are not cut off.
+    """
+    half_width_nm = max(float(half_width_nm), 1e-4)
+    pad_nm = max(float(pad_nm), 1e-4)
+    ef = float(np.clip(edge_frac, 0.15, 1.0))
+    edge_w = max(pad_nm * ef, 1e-4)
+    lo = center_nm - half_width_nm - pad_nm
+    hi = center_nm + half_width_nm + pad_nm
+    integrate_lo = lo + edge_w
+    integrate_hi = hi - edge_w
+    return lo, hi, edge_w, integrate_lo, integrate_hi, ef
 
 
 def subtract_local_baseline(
@@ -115,47 +320,70 @@ def subtract_local_baseline(
     intensity: np.ndarray,
     center_nm: float,
     *,
-    half_width_nm: float = 0.20,
-    pad_nm: float = 0.40,
+    half_width_nm: float = 0.15,
+    pad_nm: float = 0.12,
+    method: str = "linear",
+    edge_frac: float = 0.40,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Local continuum via edge-percentile baseline in a window around ``center_nm``.
+    Local continuum from **narrow outer-edge** strips beside the peak.
+
+    Window is ``center ± (half_width + pad)``. Baseline anchors use only the
+    outer ``edge_frac`` of each pad. Net area (see ``integrate_peak_area``)
+    covers everything **between** those strips so peak wings are not clipped.
+
+    ``method``:
+      - ``linear`` — line between left/right edge levels (default)
+      - ``flat`` — constant level from both edges
 
     Returns (wl_slice, intensity_corrected, baseline_on_slice).
     """
-    lo = center_nm - half_width_nm - pad_nm
-    hi = center_nm + half_width_nm + pad_nm
+    method = (method or "linear").strip().lower()
+    if method not in BASELINE_METHODS:
+        method = "linear"
+
+    lo, hi, edge_w, _, _, _ = _window_bounds(
+        center_nm, half_width_nm, pad_nm, edge_frac=edge_frac
+    )
     mask = (wavelength_nm >= lo) & (wavelength_nm <= hi)
     if not np.any(mask):
         empty = np.array([], dtype=float)
         return empty, empty, empty
 
-    wl = wavelength_nm[mask]
-    y = intensity[mask].astype(float)
+    wl = np.asarray(wavelength_nm[mask], dtype=float)
+    y = np.asarray(intensity[mask], dtype=float)
 
-    # Use samples outside the integration core as baseline anchors
-    core = (wl >= center_nm - half_width_nm) & (wl <= center_nm + half_width_nm)
-    wings = ~core
-    if np.count_nonzero(wings) >= 4:
-        level = float(np.percentile(y[wings], 10))
+    left_edge = (wl >= lo) & (wl <= lo + edge_w)
+    right_edge = (wl >= hi - edge_w) & (wl <= hi)
+
+    def _edge_level(sel: np.ndarray) -> tuple[float, float] | None:
+        if np.count_nonzero(sel) < 2:
+            return None
+        # Low percentile resists noise spikes; still below typical peak tails
+        return float(np.median(wl[sel])), float(np.percentile(y[sel], 20))
+
+    left = _edge_level(left_edge)
+    right = _edge_level(right_edge)
+
+    # Fallbacks if an edge is empty (window clipped / sparse sampling)
+    if left is None and right is None:
+        wings = (wl < center_nm - half_width_nm) | (wl > center_nm + half_width_nm)
+        level = float(np.percentile(y[wings] if np.any(wings) else y, 20))
+        baseline = np.full_like(wl, level)
+    elif left is None:
+        baseline = np.full_like(wl, right[1])  # type: ignore[index]
+    elif right is None:
+        baseline = np.full_like(wl, left[1])
+    elif method == "flat":
+        baseline = np.full_like(wl, 0.5 * (left[1] + right[1]))
     else:
-        level = float(np.percentile(y, 10))
-
-    # Mild linear tilt from left/right wing medians when available
-    left = y[wl < center_nm - half_width_nm]
-    right = y[wl > center_nm + half_width_nm]
-    if len(left) >= 2 and len(right) >= 2:
-        y_l = float(np.median(left))
-        y_r = float(np.median(right))
-        x_l = float(np.median(wl[wl < center_nm - half_width_nm]))
-        x_r = float(np.median(wl[wl > center_nm + half_width_nm]))
+        x_l, y_l = left
+        x_r, y_r = right
         if abs(x_r - x_l) > 1e-9:
             slope = (y_r - y_l) / (x_r - x_l)
             baseline = y_l + slope * (wl - x_l)
         else:
-            baseline = np.full_like(wl, level)
-    else:
-        baseline = np.full_like(wl, level)
+            baseline = np.full_like(wl, 0.5 * (y_l + y_r))
 
     return wl, y - baseline, baseline
 
@@ -164,32 +392,408 @@ def integrate_peak_area(
     spectrum: Spectrum,
     center_nm: float,
     *,
-    half_width_nm: float = 0.20,
-    pad_nm: float = 0.40,
+    half_width_nm: float = 0.15,
+    pad_nm: float = 0.12,
+    method: str = "linear",
+    edge_frac: float = 0.40,
 ) -> float:
-    """Net peak area (trapezoid) after local baseline subtraction."""
+    """
+    Net peak area (trapezoid) after local baseline subtraction.
+
+    Integrates the full span **between** the left/right edge-anchor strips
+    (not only ``center ± half_width``), so peak shoulders are included.
+    """
+    _lo, _hi, _edge_w, integrate_lo, integrate_hi, _ef = _window_bounds(
+        center_nm, half_width_nm, pad_nm, edge_frac=edge_frac
+    )
     wl, y_corr, _ = subtract_local_baseline(
         spectrum.wavelength_nm,
         spectrum.intensity,
         center_nm,
         half_width_nm=half_width_nm,
         pad_nm=pad_nm,
+        method=method,
+        edge_frac=edge_frac,
     )
     if len(wl) < 2:
         return 0.0
-    core = (wl >= center_nm - half_width_nm) & (wl <= center_nm + half_width_nm)
+    core = (wl >= integrate_lo) & (wl <= integrate_hi)
     if np.count_nonzero(core) < 2:
         return float(max(np.max(y_corr), 0.0)) if len(y_corr) else 0.0
     area = float(np.trapezoid(np.clip(y_corr[core], 0.0, None), wl[core]))
     return max(area, 0.0)
 
 
+PEAK_MODELS: tuple[str, ...] = ("gaussian", "voigt", "net_area")
+
+
+@dataclass
+class PeakFitResult:
+    """Result of a local emission-line fit (or net-area fallback)."""
+
+    nist_center_nm: float
+    fitted_center_nm: float
+    delta_nm: float
+    amplitude: float
+    fwhm_nm: float
+    area: float
+    peak_model: str
+    fit_ok: bool
+    fit_wavelength_nm: np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
+    fit_intensity: np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
+    message: str = ""
+
+
+def _normalize_peak_model(peak_model: str | None) -> str:
+    m = (peak_model or "gaussian").strip().lower()
+    if m in ("gauss", "g"):
+        return "gaussian"
+    if m in ("v",):
+        return "voigt"
+    if m in ("area", "trap", "trapezoid", "net"):
+        return "net_area"
+    if m not in PEAK_MODELS:
+        return "gaussian"
+    return m
+
+
+def _gaussian_profile(wl: np.ndarray, amp: float, center: float, sigma: float) -> np.ndarray:
+    s = max(float(sigma), 1e-6)
+    return amp * np.exp(-0.5 * ((wl - center) / s) ** 2)
+
+
+def _voigt_profile(
+    wl: np.ndarray, amp: float, center: float, sigma: float, gamma: float
+) -> np.ndarray:
+    from scipy.special import voigt_profile
+
+    s = max(float(sigma), 1e-6)
+    g = max(float(gamma), 1e-9)
+    # voigt_profile is area-normalized; scale so peak ≈ amp at center
+    core = voigt_profile(wl - center, s, g)
+    peak = float(voigt_profile(0.0, s, g))
+    if peak <= 0:
+        return np.zeros_like(wl)
+    return amp * (core / peak)
+
+
+def _fwhm_gaussian(sigma: float) -> float:
+    return float(2.354820045 * max(sigma, 0.0))
+
+
+def _fwhm_voigt(sigma: float, gamma: float) -> float:
+    # Olivero & Longbothum approximation
+    fg = _fwhm_gaussian(sigma)
+    fl = float(2.0 * max(gamma, 0.0))
+    return 0.5346 * fl + float(np.sqrt(0.2166 * fl * fl + fg * fg))
+
+
+def fit_emission_peak(
+    spectrum: Spectrum,
+    center_nm: float,
+    *,
+    half_width_nm: float = 0.15,
+    pad_nm: float = 0.12,
+    baseline_method: str = "linear",
+    peak_model: str = "gaussian",
+    shift_tol_nm: float = 0.15,
+    edge_frac: float = 0.40,
+) -> PeakFitResult:
+    """
+    Fit a Gaussian or Voigt to the local baseline-corrected peak.
+
+    Fitted center is constrained to ``center_nm ± shift_tol_nm``. Area is the
+    integral of the fitted profile (above zero). On failure, falls back to
+    trapezoid net area with ``fit_ok=False``.
+    """
+    from scipy.optimize import curve_fit
+
+    model = _normalize_peak_model(peak_model)
+    tol = max(float(shift_tol_nm), 1e-4)
+    net = integrate_peak_area(
+        spectrum,
+        center_nm,
+        half_width_nm=half_width_nm,
+        pad_nm=pad_nm,
+        method=baseline_method,
+        edge_frac=edge_frac,
+    )
+
+    def _fallback(msg: str) -> PeakFitResult:
+        return PeakFitResult(
+            nist_center_nm=center_nm,
+            fitted_center_nm=center_nm,
+            delta_nm=0.0,
+            amplitude=0.0,
+            fwhm_nm=0.0,
+            area=float(net),
+            peak_model=model,
+            fit_ok=False,
+            message=msg,
+        )
+
+    if model == "net_area":
+        return PeakFitResult(
+            nist_center_nm=center_nm,
+            fitted_center_nm=center_nm,
+            delta_nm=0.0,
+            amplitude=0.0,
+            fwhm_nm=0.0,
+            area=float(net),
+            peak_model="net_area",
+            fit_ok=True,
+            message="net area",
+        )
+
+    _lo, _hi, _ew, integrate_lo, integrate_hi, _ef = _window_bounds(
+        center_nm, half_width_nm, pad_nm, edge_frac=edge_frac
+    )
+    wl_all, y_corr, _ = subtract_local_baseline(
+        spectrum.wavelength_nm,
+        spectrum.intensity,
+        center_nm,
+        half_width_nm=half_width_nm,
+        pad_nm=pad_nm,
+        method=baseline_method,
+        edge_frac=edge_frac,
+    )
+    if len(wl_all) < 5:
+        return _fallback("too few samples in window")
+
+    core = (wl_all >= integrate_lo) & (wl_all <= integrate_hi)
+    if np.count_nonzero(core) < 5:
+        return _fallback("too few samples in integrate span")
+
+    wl = wl_all[core]
+    y = np.clip(y_corr[core], 0.0, None)
+    if float(np.nanmax(y)) <= 0:
+        return _fallback("no positive signal after baseline")
+
+    # Seed from local maximum within shift tolerance of NIST λ
+    near = (wl >= center_nm - tol) & (wl <= center_nm + tol)
+    if not np.any(near):
+        near = np.ones(len(wl), dtype=bool)
+    seed_idx = int(np.argmax(y[near]))
+    seed_wl = float(wl[near][seed_idx])
+    seed_amp = float(y[near][seed_idx])
+    span = max(float(integrate_hi - integrate_lo), 1e-3)
+    seed_sigma = max(span / 6.0, 0.01)
+
+    c_lo, c_hi = center_nm - tol, center_nm + tol
+    amp_hi = max(seed_amp * 5.0, seed_amp + 1.0)
+    sig_hi = max(span, 0.05)
+
+    try:
+        if model == "voigt":
+            seed_gamma = seed_sigma * 0.3
+
+            def model_fn(x, amp, cen, sig, gam):
+                return _voigt_profile(x, amp, cen, sig, gam)
+
+            p0 = (seed_amp, seed_wl, seed_sigma, seed_gamma)
+            bounds = (
+                (0.0, c_lo, 1e-4, 1e-6),
+                (amp_hi, c_hi, sig_hi, sig_hi),
+            )
+            popt, _ = curve_fit(
+                model_fn, wl, y, p0=p0, bounds=bounds, maxfev=20000
+            )
+            amp, cen, sig, gam = (float(v) for v in popt)
+            y_fit = _voigt_profile(wl, amp, cen, sig, gam)
+            fwhm = _fwhm_voigt(sig, gam)
+        else:
+            def model_fn(x, amp, cen, sig):
+                return _gaussian_profile(x, amp, cen, sig)
+
+            p0 = (seed_amp, seed_wl, seed_sigma)
+            bounds = (
+                (0.0, c_lo, 1e-4),
+                (amp_hi, c_hi, sig_hi),
+            )
+            popt, _ = curve_fit(
+                model_fn, wl, y, p0=p0, bounds=bounds, maxfev=20000
+            )
+            amp, cen, sig = (float(v) for v in popt)
+            y_fit = _gaussian_profile(wl, amp, cen, sig)
+            fwhm = _fwhm_gaussian(sig)
+    except Exception as exc:
+        return _fallback(f"fit failed: {exc}")
+
+    area = float(np.trapezoid(np.clip(y_fit, 0.0, None), wl))
+    if not np.isfinite(area) or area < 0:
+        return _fallback("non-finite fitted area")
+
+    # Dense curve for QC overlay (on baseline scale: baseline + profile)
+    wl_dense = np.linspace(float(wl[0]), float(wl[-1]), max(len(wl) * 4, 80))
+    if model == "voigt":
+        y_dense = _voigt_profile(wl_dense, amp, cen, sig, gam)
+    else:
+        y_dense = _gaussian_profile(wl_dense, amp, cen, sig)
+
+    return PeakFitResult(
+        nist_center_nm=center_nm,
+        fitted_center_nm=cen,
+        delta_nm=cen - center_nm,
+        amplitude=amp,
+        fwhm_nm=fwhm,
+        area=max(area, 0.0),
+        peak_model=model,
+        fit_ok=True,
+        fit_wavelength_nm=wl_dense,
+        fit_intensity=y_dense,
+        message="ok",
+    )
+
+
+def extract_peak_intensity(
+    spectrum: Spectrum,
+    center_nm: float,
+    *,
+    half_width_nm: float = 0.15,
+    pad_nm: float = 0.12,
+    baseline_method: str = "linear",
+    peak_model: str = "gaussian",
+    shift_tol_nm: float = 0.15,
+    edge_frac: float = 0.40,
+) -> float:
+    """
+    Peak intensity metric for I→C: fitted area (gaussian/voigt) or net area.
+
+    Always returns a finite non-negative float (0 on empty windows).
+    """
+    result = fit_emission_peak(
+        spectrum,
+        center_nm,
+        half_width_nm=half_width_nm,
+        pad_nm=pad_nm,
+        baseline_method=baseline_method,
+        peak_model=peak_model,
+        shift_tol_nm=shift_tol_nm,
+        edge_frac=edge_frac,
+    )
+    return float(max(result.area, 0.0))
+
+
+@dataclass
+class PeakIntegrationView:
+    """Diagnostic snapshot of local baseline + peak extraction."""
+
+    center_nm: float
+    half_width_nm: float
+    pad_nm: float
+    wavelength_nm: np.ndarray
+    intensity: np.ndarray
+    baseline: np.ndarray
+    corrected: np.ndarray
+    area: float
+    method: str = "linear"
+    edge_lo_nm: float = 0.0
+    edge_hi_left_nm: float = 0.0
+    edge_lo_right_nm: float = 0.0
+    edge_hi_nm: float = 0.0
+    integrate_lo_nm: float = 0.0
+    integrate_hi_nm: float = 0.0
+    peak_model: str = "gaussian"
+    fit_ok: bool = False
+    fitted_center_nm: float = 0.0
+    delta_nm: float = 0.0
+    fwhm_nm: float = 0.0
+    fit_wavelength_nm: np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
+    #: Fitted profile in raw intensity units (baseline + model)
+    fit_intensity: np.ndarray = field(default_factory=lambda: np.array([], dtype=float))
+
+
+def peak_integration_view(
+    spectrum: Spectrum,
+    center_nm: float,
+    *,
+    half_width_nm: float = 0.15,
+    pad_nm: float = 0.12,
+    method: str = "linear",
+    edge_frac: float = 0.40,
+    peak_model: str = "gaussian",
+    shift_tol_nm: float = 0.15,
+) -> PeakIntegrationView | None:
+    """
+    Return arrays for Peak QC: baseline, net span, and optional fitted profile.
+    """
+    lo, hi, edge_w, integrate_lo, integrate_hi, _ef = _window_bounds(
+        center_nm, half_width_nm, pad_nm, edge_frac=edge_frac
+    )
+    # Slightly wider slice for context when auto-zooming the QC plot
+    context = max(0.05, 0.25 * (hi - lo))
+    mask = (spectrum.wavelength_nm >= lo - context) & (
+        spectrum.wavelength_nm <= hi + context
+    )
+    if not np.any(mask):
+        return None
+    wl_raw = np.asarray(spectrum.wavelength_nm[mask], dtype=float)
+    y_raw = np.asarray(spectrum.intensity[mask], dtype=float)
+    wl, y_corr, baseline = subtract_local_baseline(
+        spectrum.wavelength_nm,
+        spectrum.intensity,
+        center_nm,
+        half_width_nm=half_width_nm,
+        pad_nm=pad_nm,
+        method=method,
+        edge_frac=edge_frac,
+    )
+    if len(wl) < 2:
+        return None
+
+    fit = fit_emission_peak(
+        spectrum,
+        center_nm,
+        half_width_nm=half_width_nm,
+        pad_nm=pad_nm,
+        baseline_method=method,
+        peak_model=peak_model,
+        shift_tol_nm=shift_tol_nm,
+        edge_frac=edge_frac,
+    )
+    # Interpolate baseline onto the (possibly wider) display slice
+    baseline_disp = np.interp(wl_raw, wl, baseline, left=baseline[0], right=baseline[-1])
+    y_corr_disp = y_raw - baseline_disp
+
+    fit_wl = fit.fit_wavelength_nm
+    fit_y_raw = np.array([], dtype=float)
+    if fit.fit_ok and len(fit_wl) and len(fit.fit_intensity):
+        base_on_fit = np.interp(fit_wl, wl, baseline, left=baseline[0], right=baseline[-1])
+        fit_y_raw = base_on_fit + fit.fit_intensity
+
+    return PeakIntegrationView(
+        center_nm=center_nm,
+        half_width_nm=half_width_nm,
+        pad_nm=pad_nm,
+        wavelength_nm=wl_raw,
+        intensity=y_raw,
+        baseline=baseline_disp,
+        corrected=y_corr_disp,
+        area=float(fit.area),
+        method=(method or "linear"),
+        edge_lo_nm=lo,
+        edge_hi_left_nm=lo + edge_w,
+        edge_lo_right_nm=hi - edge_w,
+        edge_hi_nm=hi,
+        integrate_lo_nm=integrate_lo,
+        integrate_hi_nm=integrate_hi,
+        peak_model=fit.peak_model,
+        fit_ok=fit.fit_ok,
+        fitted_center_nm=fit.fitted_center_nm if fit.fit_ok else center_nm,
+        delta_nm=fit.delta_nm if fit.fit_ok else 0.0,
+        fwhm_nm=fit.fwhm_nm if fit.fit_ok else 0.0,
+        fit_wavelength_nm=fit_wl,
+        fit_intensity=fit_y_raw,
+    )
+
+
 def peak_net_height(
     spectrum: Spectrum,
     center_nm: float,
     *,
-    half_width_nm: float = 0.20,
-    pad_nm: float = 0.40,
+    half_width_nm: float = 0.15,
+    pad_nm: float = 0.12,
+    method: str = "linear",
 ) -> float:
     """Net peak height at nearest sample after local baseline (secondary metric)."""
     wl, y_corr, _ = subtract_local_baseline(
@@ -198,6 +802,7 @@ def peak_net_height(
         center_nm,
         half_width_nm=half_width_nm,
         pad_nm=pad_nm,
+        method=method,
     )
     if len(wl) == 0:
         return 0.0
@@ -462,11 +1067,14 @@ def build_fits(
             if conc is None:
                 continue
             try:
-                inten = integrate_peak_area(
+                inten = extract_peak_intensity(
                     std.spectrum,
                     dline.wavelength_nm,
                     half_width_nm=cal.half_width_nm,
                     pad_nm=cal.baseline_pad_nm,
+                    baseline_method=cal.baseline_method,
+                    peak_model=cal.peak_model,
+                    shift_tol_nm=cal.shift_tol_nm,
                 )
             except Exception as exc:
                 _note(f"{label}: integration failed on {std.sample_id} ({exc})")
@@ -527,7 +1135,66 @@ def build_fits(
 
 
 def predict_from_fit(fit: CurveFit, intensity: float) -> float:
-    return float(np.polyval(fit.coeffs, intensity))
+    """Evaluate I→C curve; concentrations below zero are floored to 0."""
+    c = float(np.polyval(fit.coeffs, intensity))
+    return 0.0 if c < 0.0 else c
+
+
+def predict_with_intensities(
+    cal: CalibrationSet,
+    unknown: Spectrum,
+    *,
+    elements: list[str] | None = None,
+) -> tuple[list[ElementPrediction], dict[tuple[str, float], float]]:
+    """
+    Apply fitted curves to an unknown; return predictions and per-line intensities.
+
+    Intensities are keyed by ``(element, wavelength_nm)`` matching ``cal.fits``.
+    """
+    if not cal.fits:
+        build_fits(cal)
+
+    report = list(elements) if elements is not None else cal.active_elements()
+    report_set = set(report)
+
+    by_el: dict[str, list[tuple[float, float]]] = {}
+    intensities: dict[tuple[str, float], float] = {}
+    for fit in cal.fits:
+        if fit.element not in report_set:
+            continue
+        inten = extract_peak_intensity(
+            unknown,
+            fit.wavelength_nm,
+            half_width_nm=cal.half_width_nm,
+            pad_nm=cal.baseline_pad_nm,
+            baseline_method=cal.baseline_method,
+            peak_model=cal.peak_model,
+            shift_tol_nm=cal.shift_tol_nm,
+        )
+        c = predict_from_fit(fit, inten)
+        by_el.setdefault(fit.element, []).append((fit.wavelength_nm, c))
+        intensities[(fit.element, float(fit.wavelength_nm))] = float(inten)
+
+    preds: list[ElementPrediction] = []
+    for el in report:
+        pairs = by_el.get(el, [])
+        if not pairs:
+            continue
+        vals = [c for _, c in pairs]
+        mean = float(np.mean(vals))
+        if mean < 0.0:
+            mean = 0.0
+        std = float(np.std(vals, ddof=1)) if len(vals) > 1 else None
+        preds.append(
+            ElementPrediction(
+                element=el,
+                concentration=mean,
+                std=std,
+                n_lines=len(vals),
+                line_predictions=pairs,
+            )
+        )
+    return preds, intensities
 
 
 def predict_concentrations(
@@ -540,45 +1207,30 @@ def predict_concentrations(
     Apply fitted curves to an unknown; average enabled lines per element.
 
     ``elements`` limits the report (e.g. 2–3 of interest). Default:
-    ``cal.active_elements()`` (checked quantify set).
+    ``cal.active_elements()`` (checked quantify set). Negative curve
+    extrapolations are reported as 0 (below calibration / LOD).
     """
-    if not cal.fits:
-        build_fits(cal)
-
-    report = list(elements) if elements is not None else cal.active_elements()
-    report_set = set(report)
-
-    by_el: dict[str, list[tuple[float, float]]] = {}
-    for fit in cal.fits:
-        if fit.element not in report_set:
-            continue
-        inten = integrate_peak_area(
-            unknown,
-            fit.wavelength_nm,
-            half_width_nm=cal.half_width_nm,
-            pad_nm=cal.baseline_pad_nm,
-        )
-        c = predict_from_fit(fit, inten)
-        by_el.setdefault(fit.element, []).append((fit.wavelength_nm, c))
-
-    preds: list[ElementPrediction] = []
-    for el in report:
-        pairs = by_el.get(el, [])
-        if not pairs:
-            continue
-        vals = [c for _, c in pairs]
-        mean = float(np.mean(vals))
-        std = float(np.std(vals, ddof=1)) if len(vals) > 1 else None
-        preds.append(
-            ElementPrediction(
-                element=el,
-                concentration=mean,
-                std=std,
-                n_lines=len(vals),
-                line_predictions=pairs,
-            )
-        )
+    preds, _ = predict_with_intensities(cal, unknown, elements=elements)
     return preds
+
+
+def quantify_spectrum(
+    cal: CalibrationSet,
+    unknown: Spectrum,
+    *,
+    index: int,
+    elements: list[str] | None = None,
+) -> QuantSpectrumResult:
+    """Build a ``QuantSpectrumResult`` for one unknown spectrum."""
+    preds, intensities = predict_with_intensities(cal, unknown, elements=elements)
+    path = unknown.meta.path
+    return QuantSpectrumResult(
+        index=int(index),
+        filename=path.name,
+        spectrum_path=str(path),
+        predictions=preds,
+        line_intensities=intensities,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -752,6 +1404,9 @@ def calibration_set_to_dict(cal: CalibrationSet) -> dict:
         "concentration_unit": cal.concentration_unit,
         "half_width_nm": cal.half_width_nm,
         "baseline_pad_nm": cal.baseline_pad_nm,
+        "baseline_method": cal.baseline_method,
+        "peak_model": cal.peak_model,
+        "shift_tol_nm": cal.shift_tol_nm,
         "overlap_tol_nm": cal.overlap_tol_nm,
         "fit_degree": cal.fit_degree,
         "min_standards": cal.min_standards,
@@ -812,8 +1467,16 @@ def load_calibration_set(path: Path) -> CalibrationSet:
     cal = CalibrationSet(
         elements=elements,
         quantify_elements=quantify,
-        half_width_nm=float(data.get("half_width_nm", 0.20)),
-        baseline_pad_nm=float(data.get("baseline_pad_nm", 0.40)),
+        half_width_nm=float(data.get("half_width_nm", 0.15)),
+        baseline_pad_nm=float(data.get("baseline_pad_nm", 0.12)),
+        baseline_method=(
+            m
+            if (m := str(data.get("baseline_method") or "linear").strip().lower())
+            in ("linear", "flat")
+            else "linear"
+        ),
+        peak_model=_normalize_peak_model(str(data.get("peak_model") or "gaussian")),
+        shift_tol_nm=float(data.get("shift_tol_nm", 0.15)),
         overlap_tol_nm=float(data.get("overlap_tol_nm", 0.12)),
         fit_degree=int(data.get("fit_degree", 1)),
         min_standards=int(data.get("min_standards", 2)),
@@ -871,9 +1534,20 @@ def add_standard_from_path(
     sample_id: str | None = None,
     atmosphere: str | None = None,
 ) -> StandardSample:
-    """Load a spectrum and append it to the calibration set."""
+    """Load a spectrum and append it to the calibration set.
+
+    Replicate shots of the same CRM are encouraged: each file is one point on
+    the I→C curve. Give them the same concentration; unique ``sample_id`` values
+    are auto-suffixed if the stem collides.
+    """
     spectrum = load_spectrum(Path(txt_path), cfg_path)
     sid = sample_id or spectrum.meta.path.stem
+    existing = {s.sample_id for s in cal.standards}
+    if sid in existing:
+        stem, i = sid, 2
+        while f"{stem}_{i}" in existing:
+            i += 1
+        sid = f"{stem}_{i}"
     # Preserve element columns already in use
     concs = {el: None for el in cal.elements}
     std = StandardSample(
@@ -885,6 +1559,49 @@ def add_standard_from_path(
     cal.standards.append(std)
     return std
 
+
+def set_standard_concentrations(
+    standards: list[StandardSample],
+    element: str,
+    value: float | None,
+    *,
+    indices: list[int] | None = None,
+) -> int:
+    """
+    Set ``element`` concentration on selected standards (or all if indices is None).
+
+    Returns how many standards were updated. Use the same value on replicate
+    spectra of one CRM so each shot contributes an independent I at that C.
+    """
+    el = (element or "").strip()
+    if not el:
+        return 0
+    if indices is None:
+        targets = list(range(len(standards)))
+    else:
+        targets = [i for i in indices if 0 <= i < len(standards)]
+    n = 0
+    for i in targets:
+        standards[i].concentrations[el] = None if value is None else float(value)
+        n += 1
+    return n
+
+
+def concentration_level_summary(
+    concentrations: list[float],
+    *,
+    tol: float = 1e-9,
+) -> tuple[int, int]:
+    """Return ``(n_points, n_unique_C_levels)`` for finite concentrations."""
+    vals = [float(c) for c in concentrations if c is not None and np.isfinite(c)]
+    if not vals:
+        return 0, 0
+    # Cluster nearly-equal C values (replicate shots share a level)
+    levels: list[float] = []
+    for v in sorted(vals):
+        if not levels or abs(v - levels[-1]) > max(tol, 1e-6 * max(abs(v), 1.0)):
+            levels.append(v)
+    return len(vals), len(levels)
 
 def ensure_element_columns(cal: CalibrationSet, elements: list[str]) -> None:
     """Set concentration columns; new elements default into the quantify set."""
