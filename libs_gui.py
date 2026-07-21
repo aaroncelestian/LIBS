@@ -198,7 +198,7 @@ from PySide6.QtWidgets import (
 )
 
 
-from calibration import QuantSpectrumResult, quantify_spectrum
+from calibration import QuantSpectrumResult, build_fits, quantify_spectrum
 from calibration_gui import CalibrationTab
 from identify_elements import (
     ElementHit,
@@ -1448,6 +1448,8 @@ class LibsExplorerWindow(QMainWindow):
         self.quant_tab = QuantTab()
         self.quant_tab.statusMessage.connect(self.statusBar().showMessage)
         self.quant_tab.set_spectrum_resolver(self._spectrum_for_quant_result)
+        self.quant_tab.set_spectra_provider(lambda: list(self.loaded_spectra))
+        self.quant_tab.quantRequested.connect(self.quant_from_quant_tab)
         self.tabs.addTab(self.quant_tab, "Quant")
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -1474,6 +1476,13 @@ class LibsExplorerWindow(QMainWindow):
     def _on_tab_changed(self, index: int) -> None:
         if index == self.tabs.indexOf(self.calibrate_tab):
             self._sync_calibrate_context()
+        elif index == self.tabs.indexOf(self.quant_tab):
+            self._sync_quant_targets()
+
+    def _sync_quant_targets(self) -> None:
+        """Refresh Quant-tab element/spectrum checklists from Calibrate + Identify."""
+        unit = self.calibrate_tab.concentration_unit()
+        self.quant_tab.refresh_targets(self.calibrate_tab.cal, unit=unit)
 
     def browse_spectra(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -1650,6 +1659,7 @@ class LibsExplorerWindow(QMainWindow):
         self._match_cache.clear()
         if hasattr(self, "quant_tab"):
             self.quant_tab.clear_results()
+            self._sync_quant_targets()
 
         self._spectrum_index = 0
         self._set_display_mode("single", redraw=False)
@@ -2498,6 +2508,26 @@ class LibsExplorerWindow(QMainWindow):
         """Checked spectra if any; otherwise highlighted list selection."""
         return self._spectra_for_list_actions()
 
+    def quant_from_quant_tab(self) -> None:
+        """Quantify checked spectra/elements from the Quant tab."""
+        elements = self.quant_tab.selected_elements()
+        if not elements:
+            QMessageBox.information(
+                self,
+                "No elements selected",
+                "Check one or more elements on the Quant tab, then Quant.",
+            )
+            return
+        targets = self.quant_tab.selected_spectra_for_quant()
+        if not targets:
+            QMessageBox.information(
+                self,
+                "No spectra selected",
+                "Load spectra on Identify, check one or more on the Quant tab, then Quant.",
+            )
+            return
+        self._run_quant(targets, elements=elements)
+
     def quant_selected_spectra(self) -> None:
         """Apply Calibrate-tab CRM fits to each selected spectrum; open Quant tab."""
         targets = self._spectra_for_quant()
@@ -2508,6 +2538,20 @@ class LibsExplorerWindow(QMainWindow):
                 "Check one or more spectra in the list (or highlight rows), then Quant.",
             )
             return
+        # Prefer Quant-tab element checks if the user already chose some
+        elements = None
+        if self.quant_tab.list_el.count():
+            checked = self.quant_tab.selected_elements()
+            if checked:
+                elements = checked
+        self._run_quant(targets, elements=elements)
+
+    def _run_quant(
+        self,
+        targets: list[Spectrum],
+        *,
+        elements: list[str] | None = None,
+    ) -> None:
         if not self.calibrate_tab.has_fits():
             QMessageBox.information(
                 self,
@@ -2519,7 +2563,14 @@ class LibsExplorerWindow(QMainWindow):
 
         self.calibrate_tab._sync_params_from_ui()
         cal = self.calibrate_tab.cal
+        # Rebuild so CRM peak areas match the peak params used for unknowns
+        skipped: list[str] = []
+        build_fits(cal, skipped=skipped)
+        self.calibrate_tab._fill_line_table()
+        self.calibrate_tab._update_fit_summary_from_fits()
         unit = self.calibrate_tab.concentration_unit()
+        # Empty/None → quantify active calibration elements
+        el_arg = elements if elements else None
         results = []
         errors: list[str] = []
         for i, spec in enumerate(targets):
@@ -2532,11 +2583,15 @@ class LibsExplorerWindow(QMainWindow):
             except ValueError:
                 idx = i + 1
             try:
-                results.append(quantify_spectrum(cal, spec, index=idx))
+                results.append(
+                    quantify_spectrum(cal, spec, index=idx, elements=el_arg)
+                )
             except Exception as exc:
                 errors.append(f"{spec.meta.path.name}: {exc}")
 
-        self.quant_tab.set_results(results, cal, unit=unit)
+        self.quant_tab.set_results(
+            results, cal, unit=unit, select_elements=el_arg
+        )
         self.tabs.setCurrentWidget(self.quant_tab)
 
         msg = f"Quant done — {len(results)} spectrum{'a' if len(results) != 1 else ''}."

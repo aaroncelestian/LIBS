@@ -336,9 +336,10 @@ def strong_library_lines(
     By default, ranking uses tabulated NIST intensity, then Aki.
 
     When ``libs_diagnostics`` is True, prefer typical LIBS-observable lines:
-    neutrals (I) in the optical window with tabulated intensity, else ion
-    stages I/II. That avoids ranking on Cs III / deep-UV monsters that are
-    rarely the right presence test in gated air LIBS.
+    neutrals (I) in the optical window with tabulated intensity, plus strong
+    singly-ionized (II) lines (e.g. Ca II IR triplet). That avoids ranking on
+    Cs III / deep-UV monsters while still allowing ion diagnostics that are
+    common in gated air LIBS.
     """
     wanted = {e for e in elements if e}
     if not wanted or not library:
@@ -355,7 +356,7 @@ def strong_library_lines(
     def _rank_raw(line: LibraryLine) -> tuple[float, float]:
         return (line.intensity or 0.0, line.aki or 0.0)
 
-    def _libs_pool(lines: list[LibraryLine]) -> list[LibraryLine]:
+    def _libs_choose(lines: list[LibraryLine], n: int) -> list[LibraryLine]:
         neutrals = [
             L
             for L in lines
@@ -364,26 +365,49 @@ def strong_library_lines(
             and L.intensity > 0
             and 250.0 <= L.wavelength_nm <= 850.0
         ]
-        if neutrals:
-            return neutrals
         ions = [
             L
             for L in lines
-            if (L.ion_stage or 1) <= 2
+            if (L.ion_stage or 0) == 2
             and L.intensity is not None
             and L.intensity > 0
         ]
-        if ions:
-            return ions
-        return [L for L in lines if (L.ion_stage or 1) <= 2] or list(lines)
+        ranked_n = sorted(neutrals, key=_rank_raw, reverse=True)
+        ranked_i = sorted(ions, key=_rank_raw, reverse=True)
+        if not ranked_n and not ranked_i:
+            pool = [L for L in lines if (L.ion_stage or 1) <= 2] or list(lines)
+            return sorted(pool, key=_rank_raw, reverse=True)[:n]
+        # Neutrals first (presence / primary), but reserve ion slots so
+        # Ca II 854/866 etc. are not crowded out by UV Ca II / Ca I only.
+        n_ion = min(len(ranked_i), max(0, min(4, n // 2))) if ranked_i else 0
+        n_neu = n - n_ion
+        chosen: list[LibraryLine] = []
+        seen: set[float] = set()
+
+        def _add(src: list[LibraryLine], limit: int) -> None:
+            for L in src:
+                if len(chosen) >= limit:
+                    return
+                key = round(L.wavelength_nm, 4)
+                if key in seen:
+                    continue
+                seen.add(key)
+                chosen.append(L)
+
+        _add(ranked_n, n_neu)
+        _add(ranked_i, n)
+        _add(ranked_n, n)
+        return chosen
 
     out: dict[str, list[LibraryLine]] = {}
     for el in elements:  # preserve caller order
         if el not in by_el:
             continue
-        pool = _libs_pool(by_el[el]) if libs_diagnostics else by_el[el]
-        ranked = sorted(pool, key=_rank_raw, reverse=True)
-        out[el] = ranked[:max_per_element]
+        if libs_diagnostics:
+            out[el] = _libs_choose(by_el[el], max_per_element)
+        else:
+            ranked = sorted(by_el[el], key=_rank_raw, reverse=True)
+            out[el] = ranked[:max_per_element]
     return out
 
 
@@ -492,6 +516,49 @@ def match_library_lines(
     for lines in strong.values():
         out.extend(lines)
     return out
+
+
+def augment_match_library_near_peaks(
+    match_lib: list[LibraryLine],
+    library: list[LibraryLine],
+    peaks: list[Peak],
+    *,
+    tol_nm: float,
+) -> list[LibraryLine]:
+    """
+    Add I/II catalog lines within ``tol_nm`` of each observed peak.
+
+    Top-N diagnostic lists are dominated by UV/optical entries, so strong
+    IR LIBS features (Ca II 854/866 nm, …) would otherwise never be
+    assignable even when they sit on obvious peaks. Unsupported dense-line
+    species are still suppressed later by the diagnostic presence prior.
+    """
+    if not peaks or not library:
+        return list(match_lib)
+    existing = {(L.element, round(L.wavelength_nm, 4)) for L in match_lib}
+    lib_wl = np.asarray([L.wavelength_nm for L in library], dtype=float)
+    order = np.argsort(lib_wl)
+    lib_wl_sorted = lib_wl[order]
+    lib_sorted = [library[i] for i in order]
+    extra: list[LibraryLine] = []
+    for peak in peaks:
+        lo = int(np.searchsorted(lib_wl_sorted, peak.wavelength_nm - tol_nm))
+        hi = int(np.searchsorted(lib_wl_sorted, peak.wavelength_nm + tol_nm))
+        for k in range(lo, hi):
+            line = lib_sorted[k]
+            stage = line.ion_stage or 1
+            if stage > 2:
+                continue
+            if line.intensity is None or line.intensity <= 0:
+                continue
+            key = (line.element, round(line.wavelength_nm, 4))
+            if key in existing:
+                continue
+            existing.add(key)
+            extra.append(line)
+    if not extra:
+        return list(match_lib)
+    return list(match_lib) + extra
 
 
 def element_diagnostic_support(
@@ -615,11 +682,24 @@ def match_peaks(
         )
         if not match_lib:
             match_lib = library
+        else:
+            # Peak-local I/II lines (Ca II IR triplet, …) omitted from top-N
+            match_lib = augment_match_library_near_peaks(
+                match_lib, library, peaks, tol_nm=tol_nm
+            )
 
     lib_wl = np.array([L.wavelength_nm for L in match_lib])
     order = np.argsort(lib_wl)
     lib_wl_sorted = lib_wl[order]
     lib_sorted = [match_lib[i] for i in order]
+
+    # Same-element / same-ion neighbors for multiplet consistency scoring
+    by_el_ion: dict[tuple[str, int], list[LibraryLine]] = {}
+    for line in match_lib:
+        key = (line.element, int(line.ion_stage or 1))
+        by_el_ion.setdefault(key, []).append(line)
+
+    peak_wls_sorted = np.array(sorted({p.wavelength_nm for p in peaks}), dtype=float)
 
     support: dict[str, float] = {}
     primary: dict[str, bool] = {}
@@ -672,10 +752,27 @@ def match_peaks(
     def line_strength(line: LibraryLine) -> float:
         s = 1.0
         if line.intensity is not None and line.intensity > 0:
-            s += line.intensity
+            # Soft-cap: NIST relative I can be huge for obscure Fe lines and
+            # drown real LIBS diagnostics (Ca II IR vs Fe I 866).
+            s += min(float(line.intensity), 2.0e3)
         if line.aki is not None and line.aki > 0:
             s += min(line.aki / 1e6, 5e4)
         return s
+
+    def multiplet_hits(line: LibraryLine) -> int:
+        """Sibling same-element/ion lines within 40 nm that also have peaks."""
+        sibs = by_el_ion.get((line.element, int(line.ion_stage or 1)), [])
+        if len(sibs) < 2:
+            return 0
+        n_hit = 0
+        for s in sibs:
+            if abs(s.wavelength_nm - line.wavelength_nm) < 0.02:
+                continue
+            if abs(s.wavelength_nm - line.wavelength_nm) > 40.0:
+                continue
+            if _has_nearby_peak(peak_wls_sorted, s.wavelength_nm, tol_nm):
+                n_hit += 1
+        return n_hit
 
     def presence_scale(line: LibraryLine) -> float:
         """1 = full credit; near 0 = element's diagnostics are missing."""
@@ -688,14 +785,16 @@ def match_peaks(
             # Contested peak that is itself a primary diagnostic — keep fair weight
             return 0.05 + 0.95 * max(s, 0.55)
         if s <= 0.0:
-            # No strong diagnostics observed → do not let secondary/overlap
-            # lines (huge NIST I, tiny Δλ) steal assignments.
+            # No optical diagnostics — still allow clear ion multiplets
+            # (Ca II 854+866) so they are not left unassigned.
             return 1e-8
         return 0.05 + 0.95 * s
 
     def candidate_score(delta: float, line: LibraryLine) -> float:
         # Squared Δλ so near-exact matches win; intensity breaks near-ties.
         abs_d = abs(delta)
+        n_multi = multiplet_hits(line) if prefer_strong_library else 0
+        ion_multi = n_multi >= 1 and (line.ion_stage or 1) == 2
         if prefer_strong_library and use_diagnostic_prior:
             el = line.element
             s = float(support.get(el, 0.0))
@@ -706,14 +805,24 @@ def match_peaks(
             # secondary overlaps from other species.
             if is_top_diag and s > 0.0:
                 abs_d *= 0.35
+            # Ion multiplet with confirming sibling peaks (Ca II 854+866)
+            elif ion_multi:
+                abs_d *= 0.35
+            elif s > 0.35 and (line.ion_stage or 1) <= 2:
+                abs_d *= 0.55
         d_term = (abs_d / 0.05) ** 2
         if prefer_strong_library:
             scale = presence_scale(line)
             if scale < 1e-6:
-                # Hard reject unsupported overlap candidates
-                return d_term + 1e6
+                if ion_multi:
+                    # Self-supported ion multiplet (no optical Ca I needed)
+                    scale = 0.60
+                else:
+                    # Hard reject unsupported overlap candidates
+                    return d_term + 1e6
             strength = max(line_strength(line) * scale, 1.0)
-            return d_term - 0.45 * np.log10(strength)
+            multi_term = -0.85 * min(n_multi, 3)
+            return d_term - 0.45 * np.log10(strength) + multi_term
         return d_term
 
     _REJECT = 1e5  # scores with +1e6 hard-reject land above this
@@ -798,6 +907,15 @@ STRICT_PRIMARY_ELEMENTS = frozenset(
 )
 
 
+def _ion_multiplet_cluster(matches: list[Match], *, window_nm: float = 40.0) -> bool:
+    """True if ≥2 stage-II lines cluster within ``window_nm`` (e.g. Ca II IR)."""
+    ions = [m for m in matches if (m.line.ion_stage or 1) == 2]
+    if len(ions) < 2:
+        return False
+    wls = [float(m.line.wavelength_nm) for m in ions]
+    return (max(wls) - min(wls)) <= window_nm
+
+
 def score_elements(
     matches: list[Match],
     *,
@@ -818,6 +936,8 @@ def score_elements(
     ``match_peaks``), incidental overlaps in dense spectra are filtered:
     rare-earth / uncommon species must actually match their #1 diagnostic;
     ordinary elements need the primary or ≥4 confirming peaks.
+    Clear ion multiplets (e.g. Ca II 854+866 nm) are kept even when optical
+    neutrals are weak or absent.
     """
     by_el: dict[str, list[Match]] = {}
     for m in matches:
@@ -841,6 +961,7 @@ def score_elements(
         p_wl = (
             primary_wavelength.get(el) if primary_wavelength is not None else None
         )
+        multiplet_ok = _ion_multiplet_cluster(ms)
 
         # Weak incidental matches with zero diagnostic backbone → skip
         if (
@@ -848,6 +969,7 @@ def score_elements(
             and el not in single_peak_elements
             and support <= 0.0
             and len(ms) < 4
+            and not multiplet_ok
         ):
             continue
 
@@ -876,6 +998,7 @@ def score_elements(
             and el not in STRICT_PRIMARY_ELEMENTS
             and not has_primary
             and len(ms) < 4
+            and not multiplet_ok
         ):
             continue
 
@@ -929,6 +1052,8 @@ def score_elements(
             confidence += 6.0 * support
         if has_primary:
             confidence += 5.0
+        if multiplet_ok:
+            confidence += 8.0
         confidence = float(np.clip(confidence, 0.0, 99.0))
 
         hits.append(

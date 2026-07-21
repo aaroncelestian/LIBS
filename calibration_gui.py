@@ -7,14 +7,15 @@ from pathlib import Path
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt, QEvent, QSize, QUrl, Signal
-from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
+from PySide6.QtCore import Qt, QEvent, QPoint, QSize, QTimer, QUrl, Signal
+from PySide6.QtGui import QCursor, QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
 
 from calibration import (
     CONCENTRATION_UNIT_CHOICES,
+    DEFAULT_SUGGEST_LINES_PER_ELEMENT,
     CalibrationSet,
     CurveFit,
     ElementPrediction,
@@ -47,6 +49,7 @@ from calibration import (
     convert_calibration_concentrations,
     ensure_element_columns,
     flag_line_overlaps,
+    fit_response_slope,
     load_calibration_set,
     load_concentrations_csv,
     normalize_concentration_unit,
@@ -54,14 +57,91 @@ from calibration import (
     predict_concentrations,
     save_calibration_set,
     save_concentrations_csv,
-    seed_lines_from_matches,
     set_standard_concentrations,
     suggest_diagnostic_lines,
+    usable_fits,
 )
 from identify_elements import ElementHit, LibraryLine, Spectrum
 from matplotlib_config import apply_matplotlib_config
 
 ROOT = Path(__file__).resolve().parent
+
+
+class _LineHoverPreview(QFrame):
+    """Frameless popup with a mini peak/baseline plot for one diagnostic line."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(
+            parent,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setStyleSheet(
+            "QFrame { background: #fafafa; border: 1px solid #888; border-radius: 4px; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        apply_matplotlib_config()
+        self.fig = Figure(figsize=(3.6, 2.4), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvasQTAgg(self.fig)
+        self.canvas.setFixedSize(360, 240)
+        layout.addWidget(self.canvas)
+        self._key: tuple[str, float] | None = None
+
+    def show_line(
+        self,
+        *,
+        spectrum: Spectrum,
+        label: str,
+        element: str,
+        wavelength_nm: float,
+        half_width_nm: float,
+        pad_nm: float,
+        method: str,
+        peak_model: str,
+        shift_tol_nm: float,
+        snip_iterations: int,
+    ) -> None:
+        key = (element, round(float(wavelength_nm), 4))
+        if self._key == key and self.isVisible():
+            return
+        self._key = key
+        self.ax.clear()
+        view = peak_integration_view(
+            spectrum,
+            wavelength_nm,
+            half_width_nm=half_width_nm,
+            pad_nm=pad_nm,
+            method=method,
+            peak_model=peak_model,
+            shift_tol_nm=shift_tol_nm,
+            snip_iterations=snip_iterations,
+        )
+        if view is None or len(view.wavelength_nm) < 2:
+            self.ax.text(
+                0.5,
+                0.5,
+                f"No samples near\n{element} {wavelength_nm:.3f} nm",
+                ha="center",
+                va="center",
+                transform=self.ax.transAxes,
+                color="#666",
+                fontsize=9,
+            )
+            self.ax.set_axis_off()
+        else:
+            CalibrationTab._draw_peak_integration(
+                self.ax,
+                view,
+                title_prefix=f"{element} {wavelength_nm:.3f} · {label}",
+                compact=True,
+            )
+        self.fig.tight_layout(pad=0.3)
+        self.canvas.draw_idle()
+        self.adjustSize()
 
 
 class CurveCanvas(FigureCanvasQTAgg):
@@ -85,6 +165,12 @@ class CalibrationTab(QWidget):
         self._unknown: Spectrum | None = None
         self._identify_hits: list[ElementHit] = []
         self._block_conc = False
+        self._line_hover_popup: _LineHoverPreview | None = None
+        self._line_hover_row: int = -1
+        self._line_hover_timer = QTimer(self)
+        self._line_hover_timer.setSingleShot(True)
+        self._line_hover_timer.setInterval(280)
+        self._line_hover_timer.timeout.connect(self._show_line_hover_preview)
         self._build_ui()
         self._enable_standards_drag_drop()
 
@@ -176,10 +262,19 @@ class CalibrationTab(QWidget):
         self.btn_remove_el.clicked.connect(self._remove_element)
         self.btn_seed_lines = QPushButton("Suggest lines")
         self.btn_seed_lines.setToolTip(
-            "Suggest diagnostic lines for checked elements "
-            "(from Identify matches if available, else NIST)."
+            "Suggest diagnostic lines for checked elements.\n"
+            "Prefers good calibrants (Ca II IR, K 766/770, Na D, …),\n"
+            "then Identify matches, then strong NIST lines.\n"
+            "1 line is enough for a curve; 2–4 let you average / drop bad λ."
         )
         self.btn_seed_lines.clicked.connect(self._suggest_lines)
+        self.spin_suggest_n = QSpinBox()
+        self.spin_suggest_n.setRange(1, 8)
+        self.spin_suggest_n.setValue(DEFAULT_SUGGEST_LINES_PER_ELEMENT)
+        self.spin_suggest_n.setToolTip(
+            "How many lines to suggest per checked element (default 4).\n"
+            "Uncheck bad lines after reviewing hover previews."
+        )
         self.btn_check_all = QPushButton("Check all")
         self.btn_check_all.clicked.connect(lambda: self._set_all_quantify(True))
         self.btn_check_none = QPushButton("Check none")
@@ -187,6 +282,8 @@ class CalibrationTab(QWidget):
         el_btn.addWidget(self.btn_add_el)
         el_btn.addWidget(self.btn_remove_el)
         el_btn.addWidget(self.btn_seed_lines)
+        el_btn.addWidget(QLabel("N"))
+        el_btn.addWidget(self.spin_suggest_n)
         el_l.addLayout(el_btn)
         el_btn2 = QHBoxLayout()
         el_btn2.addWidget(self.btn_check_all)
@@ -259,14 +356,24 @@ class CalibrationTab(QWidget):
 
         line_box = QGroupBox("Diagnostic lines")
         line_l = QVBoxLayout(line_box)
+        line_hint = QLabel(
+            "Hover a row to preview the peak on the QC spectrum. "
+            "1 good line is enough; keep 2–4 and uncheck bad λ."
+        )
+        line_hint.setWordWrap(True)
+        line_hint.setStyleSheet("color: #555; font-size: 11px;")
+        line_l.addWidget(line_hint)
         self.line_table = QTableWidget(0, 5)
         self.line_table.setHorizontalHeaderLabels(
             ["On", "Element", "λ (nm)", "Species", "Overlap"]
         )
         self.line_table.horizontalHeader().setStretchLastSection(True)
         self.line_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.line_table.setMouseTracking(True)
         self.line_table.itemChanged.connect(self._on_line_item_changed)
         self.line_table.itemSelectionChanged.connect(self._on_line_selection_for_plot)
+        self.line_table.cellEntered.connect(self._on_line_cell_entered)
+        self.line_table.viewport().installEventFilter(self)
         line_l.addWidget(self.line_table)
         right_l.addWidget(line_box, stretch=3)
 
@@ -301,15 +408,26 @@ class CalibrationTab(QWidget):
         form.addRow("Baseline pad", self.spin_pad)
 
         self.combo_baseline = QComboBox()
+        self.combo_baseline.addItem("SNIP (peak-clipping)", "snip")
         self.combo_baseline.addItem("Linear (edge→edge)", "linear")
         self.combo_baseline.addItem("Flat (edge mean)", "flat")
         self.combo_baseline.setToolTip(
+            "SNIP: RamanLab iterative peak-clipping (best for crowded LIBS).\n"
             "Linear: continuum tilted between left/right edge strips.\n"
-            "Flat: constant level from both edge strips (better when neighbors "
-            "bias one side)."
+            "Flat: constant level from both edge strips."
         )
         self.combo_baseline.currentIndexChanged.connect(self._on_integration_params_changed)
         form.addRow("Baseline", self.combo_baseline)
+
+        self.spin_snip = QSpinBox()
+        self.spin_snip.setRange(5, 100)
+        self.spin_snip.setValue(40)
+        self.spin_snip.setToolTip(
+            "SNIP iterations (RamanLab default 40).\n"
+            "Higher follows broader continuum; lower preserves narrower dips."
+        )
+        self.spin_snip.valueChanged.connect(self._on_integration_params_changed)
+        form.addRow("SNIP iters", self.spin_snip)
 
         self.combo_peak_model = QComboBox()
         self.combo_peak_model.addItem("Gaussian fit", "gaussian")
@@ -388,7 +506,9 @@ class CalibrationTab(QWidget):
         plot_hint = QLabel(
             "Top row: peak fits for the selected element’s best lines (by R²). "
             "Bottom row: matching I→C curves. Green = fitted λ, red dotted = NIST. "
-            "Quant unknowns from Identify → Quant tab. Rebuild after changing windows / peak model."
+            "Uncheck a line below (or on Data entry) to exclude it from Quant, "
+            "then rebuild if you re-enable lines. Negative-slope curves are still "
+            "plotted (QC-only) but excluded from Quant."
         )
         plot_hint.setStyleSheet("color: #555; font-size: 11px;")
         plot_hint.setWordWrap(True)
@@ -413,7 +533,33 @@ class CalibrationTab(QWidget):
         peak_ctrl.addWidget(QLabel("lines"))
         plot_l.addLayout(peak_ctrl)
 
+        line_use = QHBoxLayout()
+        line_use.addWidget(QLabel("Use lines"))
+        self.list_curve_lines = QListWidget()
+        self.list_curve_lines.setMaximumHeight(78)
+        self.list_curve_lines.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.list_curve_lines.setToolTip(
+            "Checked lines stay in Quant. Uncheck a bad line (poor peak / "
+            "negative slope) to exclude it immediately."
+        )
+        self.list_curve_lines.itemChanged.connect(self._on_curve_line_check_changed)
+        self.list_curve_lines.itemSelectionChanged.connect(self._on_curve_line_selected)
+        line_use.addWidget(self.list_curve_lines, stretch=1)
+        self.btn_exclude_line = QPushButton("Exclude selected")
+        self.btn_exclude_line.setToolTip(
+            "Disable the highlighted line and remove its I→C curve from Quant."
+        )
+        self.btn_exclude_line.clicked.connect(self._exclude_selected_curve_line)
+        line_use.addWidget(self.btn_exclude_line)
+        plot_l.addLayout(line_use)
+
         self.curve_canvas = CurveCanvas()
+        self._panel_fits: list[CurveFit] = []
+        self._panel_keys: list[tuple[str, float]] = []
+        self._selected_panel_fit: CurveFit | None = None
+        self.curve_canvas.mpl_connect("button_press_event", self._on_curve_canvas_click)
         self.curve_toolbar = NavigationToolbar2QT(self.curve_canvas, plot_page)
         icon = self.curve_toolbar.iconSize()
         self.curve_toolbar.setIconSize(
@@ -521,6 +667,253 @@ class CalibrationTab(QWidget):
         fits.sort(key=lambda f: (-float(f.r_squared), float(f.wavelength_nm)))
         return fits[: max(1, min(int(n), 4))]
 
+    def _panels_for_element(
+        self, element: str | None, n: int = 4
+    ) -> list[tuple[str, float, CurveFit | None]]:
+        """
+        Columns for the Curves grid: fitted lines first (by R²), then other
+        enabled diagnostic lines (peak QC only). Up to ``n`` columns.
+        """
+        if not element:
+            return []
+        n = max(1, min(int(n), 4))
+        fits = [f for f in self.cal.fits if f.element == element]
+        fits.sort(key=lambda f: (-float(f.r_squared), float(f.wavelength_nm)))
+        panels: list[tuple[str, float, CurveFit | None]] = []
+        seen: set[float] = set()
+        for fit in fits:
+            key = round(float(fit.wavelength_nm), 4)
+            if key in seen:
+                continue
+            seen.add(key)
+            panels.append((fit.element, float(fit.wavelength_nm), fit))
+            if len(panels) >= n:
+                return panels
+
+        # Fill remaining slots with enabled diagnostics (even if not yet fitted)
+        for d in self.cal.diagnostic_lines:
+            if d.element != element or not d.enabled:
+                continue
+            key = round(float(d.wavelength_nm), 4)
+            if key in seen:
+                continue
+            seen.add(key)
+            panels.append((d.element, float(d.wavelength_nm), None))
+            if len(panels) >= n:
+                break
+        return panels
+
+    @staticmethod
+    def _same_line(a_el: str, a_wl: float, b_el: str, b_wl: float) -> bool:
+        return a_el == b_el and abs(float(a_wl) - float(b_wl)) < 1e-6
+
+    def _refresh_curve_line_list(self, element: str | None) -> None:
+        if not hasattr(self, "list_curve_lines"):
+            return
+        self.list_curve_lines.blockSignals(True)
+        self.list_curve_lines.clear()
+        if not element:
+            self.list_curve_lines.blockSignals(False)
+            return
+        fits = [f for f in self.cal.fits if f.element == element]
+        fits.sort(key=lambda f: (-float(f.r_squared), float(f.wavelength_nm)))
+        # Also list disabled diagnostic lines for this element so they can be re-enabled
+        fit_keys = {(f.element, round(float(f.wavelength_nm), 6)) for f in fits}
+        for fit in fits:
+            slope = fit_response_slope(fit)
+            if fit.rejected:
+                warn = "  ⚠ QC only"
+            elif slope < 0:
+                warn = "  ⚠ neg. slope"
+            else:
+                warn = ""
+            item = QListWidgetItem(
+                f"{fit.wavelength_nm:.3f} nm  R²={fit.r_squared:.3f}{warn}"
+            )
+            item.setFlags(
+                item.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsEnabled
+            )
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(
+                Qt.ItemDataRole.UserRole,
+                (fit.element, float(fit.wavelength_nm), True),
+            )
+            if fit.rejected or slope < 0:
+                item.setForeground(Qt.GlobalColor.darkYellow)
+                tip = fit.rejected or "Negative I→C slope"
+                item.setToolTip(
+                    f"{tip} — shown for QC, excluded from Quant. "
+                    "Uncheck to drop, or pick another λ."
+                )
+            self.list_curve_lines.addItem(item)
+
+        for d in self.cal.diagnostic_lines:
+            if d.element != element:
+                continue
+            key = (d.element, round(float(d.wavelength_nm), 6))
+            if key in fit_keys:
+                continue
+            if d.enabled:
+                # Enabled but not fitted (skipped) — show unchecked? Still enabled in table
+                item = QListWidgetItem(f"{d.wavelength_nm:.3f} nm  (no fit)")
+                item.setFlags(
+                    item.flags()
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEnabled
+                )
+                item.setCheckState(Qt.CheckState.Checked)
+                item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    (d.element, float(d.wavelength_nm), False),
+                )
+                item.setToolTip("Enabled but no usable fit — rebuild or exclude.")
+                self.list_curve_lines.addItem(item)
+            else:
+                item = QListWidgetItem(f"{d.wavelength_nm:.3f} nm  (excluded)")
+                item.setFlags(
+                    item.flags()
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEnabled
+                )
+                item.setCheckState(Qt.CheckState.Unchecked)
+                item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    (d.element, float(d.wavelength_nm), False),
+                )
+                item.setToolTip("Excluded from Quant. Check and rebuild curves to restore.")
+                self.list_curve_lines.addItem(item)
+
+        # Restore selection for highlighted panel
+        if self._selected_panel_fit is not None:
+            sel = self._selected_panel_fit
+            for i in range(self.list_curve_lines.count()):
+                data = self.list_curve_lines.item(i).data(Qt.ItemDataRole.UserRole)
+                if data and self._same_line(data[0], data[1], sel.element, sel.wavelength_nm):
+                    self.list_curve_lines.setCurrentRow(i)
+                    break
+        self.list_curve_lines.blockSignals(False)
+
+    def _set_diagnostic_enabled(self, element: str, wavelength_nm: float, enabled: bool) -> None:
+        for d in self.cal.diagnostic_lines:
+            if self._same_line(d.element, d.wavelength_nm, element, wavelength_nm):
+                d.enabled = enabled
+                break
+
+    def _remove_fit(self, element: str, wavelength_nm: float) -> None:
+        self.cal.fits = [
+            f
+            for f in self.cal.fits
+            if not self._same_line(f.element, f.wavelength_nm, element, wavelength_nm)
+        ]
+
+    def _on_curve_line_check_changed(self, item: QListWidgetItem) -> None:
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        el, wl, _had_fit = data
+        enabled = item.checkState() == Qt.CheckState.Checked
+        self._set_diagnostic_enabled(str(el), float(wl), enabled)
+        if not enabled:
+            self._remove_fit(str(el), float(wl))
+            self.statusMessage.emit(f"Excluded {el} {float(wl):.3f} nm from Quant")
+            self._fill_line_table()
+            self._update_fit_summary_from_fits()
+            self._redraw_plots()
+        else:
+            self._fill_line_table()
+            self.statusMessage.emit(
+                f"Re-enabled {el} {float(wl):.3f} nm — click Build curves to restore fit"
+            )
+
+    def _on_curve_line_selected(self) -> None:
+        items = self.list_curve_lines.selectedItems()
+        if not items:
+            return
+        data = items[0].data(Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        el, wl, _ = data
+        for f in self.cal.fits:
+            if self._same_line(f.element, f.wavelength_nm, str(el), float(wl)):
+                self._selected_panel_fit = f
+                break
+
+    def _exclude_selected_curve_line(self) -> None:
+        items = self.list_curve_lines.selectedItems()
+        if not items and self._selected_panel_fit is not None:
+            fit = self._selected_panel_fit
+            self._set_diagnostic_enabled(fit.element, fit.wavelength_nm, False)
+            self._remove_fit(fit.element, fit.wavelength_nm)
+            self.statusMessage.emit(
+                f"Excluded {fit.element} {fit.wavelength_nm:.3f} nm from Quant"
+            )
+            self._selected_panel_fit = None
+            self._fill_line_table()
+            self._update_fit_summary_from_fits()
+            self._redraw_plots()
+            return
+        if not items:
+            QMessageBox.information(
+                self,
+                "Exclude line",
+                "Click a curve panel or select a line in the list, then Exclude.",
+            )
+            return
+        item = items[0]
+        item.setCheckState(Qt.CheckState.Unchecked)
+
+    def _on_curve_canvas_click(self, event) -> None:
+        if event.inaxes is None or not self._panel_keys:
+            return
+        axes = list(self.curve_canvas.fig.axes)
+        try:
+            idx = axes.index(event.inaxes)
+        except ValueError:
+            return
+        n = len(self._panel_keys)
+        panel = idx % n if idx < 2 * n else None
+        if panel is None or panel >= n:
+            return
+        el, wl = self._panel_keys[panel]
+        # Prefer matching CurveFit when present
+        self._selected_panel_fit = None
+        for f in self.cal.fits:
+            if self._same_line(f.element, f.wavelength_nm, el, wl):
+                self._selected_panel_fit = f
+                break
+        if hasattr(self, "list_curve_lines"):
+            self.list_curve_lines.blockSignals(True)
+            for i in range(self.list_curve_lines.count()):
+                data = self.list_curve_lines.item(i).data(Qt.ItemDataRole.UserRole)
+                if data and self._same_line(data[0], data[1], el, wl):
+                    self.list_curve_lines.setCurrentRow(i)
+                    break
+            self.list_curve_lines.blockSignals(False)
+        self.statusMessage.emit(
+            f"Selected {el} {wl:.3f} nm — Exclude selected to drop from Quant"
+        )
+        self._redraw_plots()
+
+    def _update_fit_summary_from_fits(self) -> None:
+        fits = self.cal.fits
+        if not fits:
+            self._set_fit_summary("No fits.")
+            return
+        parts = []
+        for f in fits:
+            tag = " QC-only" if f.rejected else ""
+            parts.append(
+                f"{f.element} {f.wavelength_nm:.3f} nm: "
+                f"R²={f.r_squared:.3f} (n={f.n_points}){tag}"
+            )
+        summary = " · ".join(parts[:6]) + (" …" if len(parts) > 6 else "")
+        self._set_fit_summary(summary)
+
     def _redraw_plots(self, *_args) -> None:
         if not hasattr(self, "curve_canvas"):
             return
@@ -530,16 +923,20 @@ class CalibrationTab(QWidget):
 
         el = self._selected_element()
         n_want = int(self.spin_n_panels.value()) if hasattr(self, "spin_n_panels") else 4
-        fits = self._top_fits_for_element(el, n_want)
+        panels = self._panels_for_element(el, n_want)
+        self._panel_fits = [p[2] for p in panels if p[2] is not None]
+        self._panel_keys = [(p[0], p[1]) for p in panels]
+        self._refresh_curve_line_list(el)
         spec, label = self._peak_qc_spectrum()
 
-        if not fits:
+        if not panels:
             ax = fig.add_subplot(111)
             ax.text(
                 0.5,
                 0.5,
                 "Build calibration curves, then select an element / line\n"
-                "on Data entry to inspect the top fits.",
+                "on Data entry to inspect the top fits.\n"
+                "Uncheck bad lines in Use lines to exclude them from Quant.",
                 ha="center",
                 va="center",
                 transform=ax.transAxes,
@@ -550,30 +947,72 @@ class CalibrationTab(QWidget):
             self.curve_canvas.draw_idle()
             return
 
-        n = len(fits)
-        for i, fit in enumerate(fits):
+        n = len(panels)
+        for i, (pel, pwl, fit) in enumerate(panels):
             ax_peak = fig.add_subplot(2, n, i + 1)
             ax_curve = fig.add_subplot(2, n, n + i + 1)
-            self._draw_peak_panel_for_fit(ax_peak, fit, spec, label)
-            self._draw_curve_for_fit(ax_curve, fit)
+            self._draw_peak_panel_at(ax_peak, pel, pwl, spec, label)
+            if fit is not None:
+                self._draw_curve_for_fit(ax_curve, fit)
+            else:
+                ax_curve.text(
+                    0.5,
+                    0.5,
+                    f"No I→C fit\n{pel} {pwl:.3f} nm\n(rebuild or exclude)",
+                    ha="center",
+                    va="center",
+                    transform=ax_curve.transAxes,
+                    color="#666",
+                    fontsize=8,
+                )
+                ax_curve.set_axis_off()
+            selected = False
+            if self._selected_panel_fit is not None and fit is not None:
+                selected = self._same_line(
+                    fit.element,
+                    fit.wavelength_nm,
+                    self._selected_panel_fit.element,
+                    self._selected_panel_fit.wavelength_nm,
+                )
+            elif (
+                self._selected_panel_fit is None
+                and hasattr(self, "list_curve_lines")
+                and self.list_curve_lines.currentRow() == i
+            ):
+                selected = True
+            if selected:
+                for spine in ax_peak.spines.values():
+                    spine.set_color("#c0392b")
+                    spine.set_linewidth(1.6)
+                for spine in ax_curve.spines.values():
+                    spine.set_color("#c0392b")
+                    spine.set_linewidth(1.6)
 
+        n_fit = sum(1 for p in panels if p[2] is not None)
+        n_quant = sum(1 for p in panels if p[2] is not None and p[2].usable)
+        n_qc = n_fit - n_quant
+        if n_qc:
+            fit_txt = f"{n_quant} for Quant, {n_qc} QC-only"
+        else:
+            fit_txt = f"{n_fit} fitted"
         fig.suptitle(
-            f"{el} — top {n} line(s) by R² · QC: {label or '—'}",
+            f"{el} — {n} line(s) ({fit_txt}) · QC: {label or '—'}",
             fontsize=11,
             y=0.995,
         )
         fig.tight_layout(rect=(0, 0, 1, 0.97), pad=0.35, w_pad=0.6, h_pad=0.8)
         self.curve_canvas.draw_idle()
 
-    def _draw_peak_panel_for_fit(
+    def _draw_peak_panel_at(
         self,
         ax,
-        fit: CurveFit,
+        element: str,
+        wavelength_nm: float,
         spec: Spectrum | None,
         label: str,
     ) -> None:
-        center = float(fit.wavelength_nm)
-        el = fit.element
+        """Peak QC for any diagnostic λ (fitted or not)."""
+        center = float(wavelength_nm)
         if spec is None:
             ax.text(
                 0.5,
@@ -585,7 +1024,7 @@ class CalibrationTab(QWidget):
                 color="#666",
                 fontsize=8,
             )
-            ax.set_title(f"{el} {center:.3f}", fontsize=9)
+            ax.set_title(f"{element} {center:.3f}", fontsize=9)
             return
         view = peak_integration_view(
             spec,
@@ -595,6 +1034,7 @@ class CalibrationTab(QWidget):
             method=self.cal.baseline_method,
             peak_model=self.cal.peak_model,
             shift_tol_nm=self.cal.shift_tol_nm,
+            snip_iterations=self.cal.snip_iterations,
         )
         if view is None or len(view.wavelength_nm) < 2:
             ax.text(
@@ -607,13 +1047,24 @@ class CalibrationTab(QWidget):
                 color="#666",
                 fontsize=8,
             )
-            ax.set_title(f"{el} {center:.3f}", fontsize=9)
+            ax.set_title(f"{element} {center:.3f}", fontsize=9)
             return
         self._draw_peak_integration(
             ax,
             view,
-            title_prefix=f"{el} {center:.3f}",
+            title_prefix=f"{element} {center:.3f}",
             compact=True,
+        )
+
+    def _draw_peak_panel_for_fit(
+        self,
+        ax,
+        fit: CurveFit,
+        spec: Spectrum | None,
+        label: str,
+    ) -> None:
+        self._draw_peak_panel_at(
+            ax, fit.element, float(fit.wavelength_nm), spec, label
         )
 
     def _draw_curve_for_fit(self, ax, fit: CurveFit) -> None:
@@ -622,18 +1073,45 @@ class CalibrationTab(QWidget):
         ax.scatter(x, y, c="#1a5276", s=28, zorder=3, alpha=0.85)
         if len(x):
             x_line = np.linspace(float(np.nanmin(x)) * 0.95, float(np.nanmax(x)) * 1.05, 60)
-            y_line = np.polyval(fit.coeffs, x_line)
-            ax.plot(x_line, y_line, color="#c0392b", lw=1.3)
+            y_line = np.maximum(np.polyval(fit.coeffs, x_line), 0.0)
+            style = {"color": "#c0392b", "lw": 1.3}
+            if fit.rejected:
+                style["ls"] = "--"
+                style["alpha"] = 0.75
+            ax.plot(x_line, y_line, **style)
         n_pts, n_levels = concentration_level_summary(list(fit.concentrations))
+        slope = fit_response_slope(fit)
+        if fit.rejected:
+            slope_note = f"  ⚠ {fit.rejected} — QC only"
+        elif slope < 0:
+            slope_note = "  ⚠ neg. slope"
+        else:
+            slope_note = ""
         ax.set_xlabel("Peak area", fontsize=8)
         ax.set_ylabel(self._unit_label(), fontsize=8)
         level_txt = f"{n_levels} C level{'s' if n_levels != 1 else ''}"
+        warn = bool(fit.rejected or slope < 0)
         ax.set_title(
-            f"I→C  R²={fit.r_squared:.3f}  n={n_pts} ({level_txt})",
-            fontsize=9,
+            f"I→C  R²={fit.r_squared:.3f}  n={n_pts} ({level_txt}){slope_note}",
+            fontsize=8 if fit.rejected else 9,
+            color="#a04000" if warn else "#000000",
         )
         ax.tick_params(labelsize=7)
         ax.grid(True, alpha=0.25)
+        y_hi = float(np.nanmax(y)) if len(y) else 0.0
+        ax.set_ylim(0.0, y_hi * 1.08 if y_hi > 0 else 1.0)
+        if fit.rejected:
+            ax.text(
+                0.98,
+                0.02,
+                "excluded from Quant",
+                transform=ax.transAxes,
+                ha="right",
+                va="bottom",
+                fontsize=7,
+                color="#a04000",
+                alpha=0.9,
+            )
 
     def _redraw_peak_qc(self) -> None:
         """Backward-compatible alias — redraws the full Curves grid."""
@@ -801,7 +1279,7 @@ class CalibrationTab(QWidget):
                     fontsize=fs_title,
                 )
             else:
-                bl_lbl = "flat" if view.method == "flat" else "linear"
+                bl_lbl = view.method or "snip"
                 ax.set_title(
                     f"{prefix}{peak_model}  area={view.area:.4g}  "
                     f"Δλ={view.delta_nm:+.3f} nm  FWHM={view.fwhm_nm:.3f} nm  "
@@ -837,12 +1315,12 @@ class CalibrationTab(QWidget):
             self.cal.atmosphere = atmosphere
 
     def has_fits(self) -> bool:
-        return bool(self.cal.fits)
+        return bool(usable_fits(self.cal))
 
     def predict_for_spectrum(self, spectrum: Spectrum) -> list[ElementPrediction]:
         """Apply current CRM fits to one unknown spectrum."""
         self._sync_params_from_ui()
-        if not self.cal.fits:
+        if not usable_fits(self.cal):
             raise ValueError("No calibration curves — build fits on the Calibrate tab first.")
         return predict_concentrations(self.cal, spectrum)
 
@@ -857,7 +1335,8 @@ class CalibrationTab(QWidget):
         self.cal.half_width_nm = float(self.spin_half.value())
         self.cal.baseline_pad_nm = float(self.spin_pad.value())
         method = self.combo_baseline.currentData()
-        self.cal.baseline_method = str(method or "linear")
+        self.cal.baseline_method = str(method or "snip")
+        self.cal.snip_iterations = int(self.spin_snip.value())
         peak_model = self.combo_peak_model.currentData()
         self.cal.peak_model = str(peak_model or "gaussian")
         self.cal.shift_tol_nm = float(self.spin_shift.value())
@@ -866,6 +1345,8 @@ class CalibrationTab(QWidget):
         self.cal.concentration_unit = self.combo_unit.currentText().strip() or "wt%"
         if hasattr(self, "spin_shift"):
             self.spin_shift.setEnabled(self.cal.peak_model != "net_area")
+        if hasattr(self, "spin_snip"):
+            self.spin_snip.setEnabled(self.cal.baseline_method == "snip")
 
     def _on_atm_changed(self, atm: str) -> None:
         self.cal.atmosphere = atm
@@ -1332,13 +1813,20 @@ class CalibrationTab(QWidget):
             QMessageBox.warning(self, "Lines", "NIST library not loaded.")
             return
 
-        # Prefer Identify matches when available
+        n_want = (
+            int(self.spin_suggest_n.value())
+            if hasattr(self, "spin_suggest_n")
+            else DEFAULT_SUGGEST_LINES_PER_ELEMENT
+        )
+        wl_min, wl_max = self._wl_range()
+
+        # Prefer Identify matches when available (still ranked after preferred λ)
         match_map: dict[str, list[tuple[float, str]]] = {}
         for hit in self._identify_hits:
             if hit.element not in active:
                 continue
             pairs = [
-                (m.peak.wavelength_nm, m.line.species)
+                (m.line.wavelength_nm, m.line.species)
                 for m in sorted(
                     hit.matches,
                     key=lambda m: m.peak.prominence,
@@ -1347,50 +1835,23 @@ class CalibrationTab(QWidget):
             ]
             match_map[hit.element] = pairs
 
-        if match_map:
-            seeded = seed_lines_from_matches(
-                match_map,
-                self.library,
-                max_per_element=8,
-                overlap_tol_nm=self.cal.overlap_tol_nm,
-            )
-            # Fill missing active elements from NIST
-            have = {d.element for d in seeded}
-            missing = [e for e in active if e not in have]
-            if missing:
-                wl_min, wl_max = self._wl_range()
-                extra = suggest_diagnostic_lines(
-                    self.library,
-                    missing,
-                    wl_min=wl_min,
-                    wl_max=wl_max,
-                    max_per_element=8,
-                    overlap_tol_nm=self.cal.overlap_tol_nm,
-                )
-                seeded.extend(extra)
-            # Keep lines for unchecked elements that already exist
-            keep_other = [
-                d for d in self.cal.diagnostic_lines if d.element not in set(active)
-            ]
-            self.cal.diagnostic_lines = keep_other + seeded
-        else:
-            wl_min, wl_max = self._wl_range()
-            seeded = suggest_diagnostic_lines(
-                self.library,
-                active,
-                wl_min=wl_min,
-                wl_max=wl_max,
-                max_per_element=8,
-                overlap_tol_nm=self.cal.overlap_tol_nm,
-            )
-            keep_other = [
-                d for d in self.cal.diagnostic_lines if d.element not in set(active)
-            ]
-            self.cal.diagnostic_lines = keep_other + seeded
+        seeded = suggest_diagnostic_lines(
+            self.library,
+            active,
+            wl_min=wl_min,
+            wl_max=wl_max,
+            max_per_element=n_want,
+            overlap_tol_nm=self.cal.overlap_tol_nm,
+            identify_matches=match_map or None,
+        )
+        keep_other = [
+            d for d in self.cal.diagnostic_lines if d.element not in set(active)
+        ]
+        self.cal.diagnostic_lines = keep_other + seeded
         self._fill_line_table()
         self.statusMessage.emit(
-            f"Suggested lines for {len(active)} checked element(s) "
-            f"(overlap warnings are soft — review before fitting)."
+            f"Suggested ≤{n_want} line(s)/element for {len(active)} element(s) "
+            f"(preferred calibrants first — hover rows to preview peaks)."
         )
 
     def _wl_range(self) -> tuple[float, float]:
@@ -1404,6 +1865,50 @@ class CalibrationTab(QWidget):
         if not wls:
             return 180.0, 1022.0
         return min(wls), max(wls)
+
+    def _on_line_cell_entered(self, row: int, _column: int) -> None:
+        self._line_hover_row = row
+        self._line_hover_timer.start()
+
+    def _hide_line_hover_preview(self) -> None:
+        self._line_hover_timer.stop()
+        if self._line_hover_popup is not None:
+            self._line_hover_popup.hide()
+            self._line_hover_popup._key = None
+
+    def _show_line_hover_preview(self) -> None:
+        row = self._line_hover_row
+        if row < 0 or row >= self.line_table.rowCount():
+            return
+        item = self.line_table.item(row, 0)
+        if item is None:
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if not key:
+            return
+        el, wl = key
+        spec, label = self._peak_qc_spectrum()
+        if spec is None:
+            return
+        self._sync_params_from_ui()
+        if self._line_hover_popup is None:
+            self._line_hover_popup = _LineHoverPreview(self)
+        self._line_hover_popup.show_line(
+            spectrum=spec,
+            label=label or "QC",
+            element=str(el),
+            wavelength_nm=float(wl),
+            half_width_nm=self.cal.half_width_nm,
+            pad_nm=self.cal.baseline_pad_nm,
+            method=self.cal.baseline_method,
+            peak_model=self.cal.peak_model,
+            shift_tol_nm=self.cal.shift_tol_nm,
+            snip_iterations=self.cal.snip_iterations,
+        )
+        # Place near cursor, keep on screen
+        pos = QCursor.pos() + QPoint(18, 14)
+        self._line_hover_popup.move(pos)
+        self._line_hover_popup.show()
 
     def _fill_line_table(self) -> None:
         self.line_table.blockSignals(True)
@@ -1450,6 +1955,21 @@ class CalibrationTab(QWidget):
             if d.element == el and abs(d.wavelength_nm - wl) < 1e-6:
                 d.enabled = enabled
                 break
+        if not enabled:
+            self._remove_fit(str(el), float(wl))
+            self._update_fit_summary_from_fits()
+            if (
+                hasattr(self, "sub_tabs")
+                and hasattr(self, "plot_page")
+                and self.sub_tabs.currentWidget() is self.plot_page
+            ):
+                self._redraw_plots()
+        elif (
+            hasattr(self, "sub_tabs")
+            and hasattr(self, "plot_page")
+            and self.sub_tabs.currentWidget() is self.plot_page
+        ):
+            self._refresh_curve_line_list(self._selected_element())
 
     # --------------------------------------------------------- fit / plot
     def _selected_elements_for_lines(self) -> list[str]:
@@ -1535,25 +2055,53 @@ class CalibrationTab(QWidget):
             )
             self._set_fit_summary("No fits.")
             return
-        parts = [
-            f"{f.element} {f.wavelength_nm:.3f} nm: R²={f.r_squared:.3f} (n={f.n_points})"
-            for f in fits
-        ]
+        parts = []
+        for f in fits:
+            tag = " QC-only" if f.rejected else ""
+            parts.append(
+                f"{f.element} {f.wavelength_nm:.3f} nm: "
+                f"R²={f.r_squared:.3f} (n={f.n_points}){tag}"
+            )
         summary = " · ".join(parts[:6]) + (" …" if len(parts) > 6 else "")
         self._set_fit_summary(summary)
+        n_ok = sum(1 for f in fits if f.usable)
+        n_rej = sum(1 for f in fits if f.rejected)
         msg = (
             f"Built {len(fits)} curve(s) for "
             f"{len(self.cal.active_elements())} checked element(s)"
         )
+        if n_rej:
+            msg += f" · {n_ok} for Quant, {n_rej} QC-only (neg. slope)"
         if skipped:
-            msg += f" · skipped {len(skipped)} line(s)"
+            msg += f" · failed {len(skipped)} line(s)"
             QMessageBox.information(
                 self,
-                "Some lines skipped",
+                "Some lines failed",
                 msg
                 + ":\n\n"
                 + "\n".join(f"• {s}" for s in skipped[:10])
                 + (f"\n… and {len(skipped) - 10} more" if len(skipped) > 10 else ""),
+            )
+        elif n_rej:
+            rej_lines = [
+                f"• {f.element} {f.wavelength_nm:.3f} nm: {f.rejected} — "
+                "curve shown for QC, excluded from Quant"
+                for f in fits
+                if f.rejected
+            ]
+            QMessageBox.information(
+                self,
+                "Some curves QC-only",
+                msg
+                + ":\n\n"
+                + "\n".join(rej_lines[:10])
+                + (
+                    f"\n… and {len(rej_lines) - 10} more"
+                    if len(rej_lines) > 10
+                    else ""
+                )
+                + "\n\nCheck CRM peak areas on those λ (interference / wrong line), "
+                "or uncheck them in Use lines.",
             )
         self.statusMessage.emit(msg)
         # Select first fit line in table if possible
@@ -1609,9 +2157,11 @@ class CalibrationTab(QWidget):
             return
         self.spin_half.setValue(self.cal.half_width_nm)
         self.spin_pad.setValue(self.cal.baseline_pad_nm)
-        bidx = self.combo_baseline.findData(self.cal.baseline_method or "linear")
+        bidx = self.combo_baseline.findData(self.cal.baseline_method or "snip")
         if bidx >= 0:
             self.combo_baseline.setCurrentIndex(bidx)
+        self.spin_snip.setValue(int(self.cal.snip_iterations or 40))
+        self.spin_snip.setEnabled((self.cal.baseline_method or "snip") == "snip")
         pidx = self.combo_peak_model.findData(self.cal.peak_model or "gaussian")
         if pidx >= 0:
             self.combo_peak_model.setCurrentIndex(pidx)
@@ -1693,6 +2243,12 @@ class CalibrationTab(QWidget):
 
     def eventFilter(self, watched, event):  # noqa: N802 — Qt API
         et = event.type()
+        if (
+            hasattr(self, "line_table")
+            and watched is self.line_table.viewport()
+            and et in (QEvent.Type.Leave, QEvent.Type.HoverLeave)
+        ):
+            self._hide_line_hover_preview()
         if et in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
             if isinstance(event, (QDragEnterEvent, QDragMoveEvent)):
                 txts, csvs = self._drop_paths_from_mime(event.mimeData())

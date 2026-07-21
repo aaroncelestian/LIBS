@@ -93,22 +93,22 @@ On the **Calibrate** tab:
 1. **Add standards** — CRM spectra (`.txt`); matching `.cfg` is picked up automatically when present. **Replicate shots** of the same CRM (e.g. six 1500 ppm Pb files) are encouraged: each spectrum is a separate I→C point at the same C, so vertical scatter at that concentration is empirical LIBS variability. After adding files, use **Set C…** (or the prompt) to assign one concentration to all selected replicates.
 2. **Add elements** — import may bring many CRM columns; **check only** the ones you want to fit / predict / plot (**Check all** / **Check none** helpers)
 3. **Enter concentrations** — edit the table by hand, or **Import CSV** / **Export CSV**
-4. **Suggest lines** — seeds diagnostic lines for checked elements from Identify matches (when available) or strong NIST lines; soft **overlap** warnings flag nearby lines from other elements
-5. **Build calibration curves** — local baseline from narrow edge strips; **Gaussian** (default) or **Voigt** peak fit with allowed λ shift (or net-area fallback); linear/quadratic I→C fit per enabled line
-6. **Quant unknowns from Identify** — use **Quant** on Identify (checked spectra); results open on the **Quant** tab. Calibrate **Curves & results** remains CRM QC only (peak fits + I→C for standards)
+4. **Suggest lines** — offers up to **N** lines/element (default 4): preferred calibrants first (Ca II IR, K 766/770, Na D, …), then Identify matches, then strong NIST. **1 good line is enough** for an I→C curve; 2–4 support multi-line means and dropping bad λ. Soft **overlap** warnings flag nearby lines from other elements. **Hover** a diagnostic-line row to preview the peak on the QC spectrum.
+5. **Build calibration curves** — local **SNIP** baseline (RamanLab peak-clipping; linear/flat also available) + Gaussian/Voigt (or net-area) with λ shift; linear/quadratic I→C fit per enabled line. **Negative-slope** curves are still plotted for QC but marked **QC-only** and excluded from Quant. On **Curves & results**, uncheck a line under **Use lines** (or **Exclude selected**) to drop a bad λ from Quant without waiting for rebuild; re-enable and rebuild to restore.
+6. **Quant unknowns** — on the **Quant** tab, check elements and spectra then **Quant**; or use **Quant** on Identify for checked spectra. Calibrate **Curves & results** remains CRM QC only (peak fits + I→C for standards)
 
 Measured peaks often sit 0.02–0.15 nm off NIST rest wavelengths (spectrometer calibration/drift, resolution, blends). Peak fitting finds the observed center within **Shift tol** and uses the **fitted area** as intensity. Identify matching already softens Δλ for strong lines; rebuild Calibrate curves after changing peak model or shift tol.
 
 ### Quant tab
 
-After **Quant** on Identify (with Calibrate curves built):
+Check **Elements** and **Spectra** (multi-select), then **Quant** on this tab — or use **Quant** on Identify for checked spectra. Requires Calibrate curves first.
 
-1. **Results table** — mean concentration per element, line-to-line **std**, **95% CI** (`mean ± t·std/√n`), and `n_lines`
-2. **Calibration curve** — CRM points + I→C fit for the selected element/line; unknown intensity→C overlaid as a star
-3. **Peak / background fit** — local baseline and Gaussian/Voigt (or net-area) window for the selected spectrum and line
-4. **Concentration vs spectrum #** — selected element across the Quant batch (time series / line scans), with line-to-line error bars and a series mean±std band when n≥2
+1. **Results table** — concentrations for checked elements (std + 95% CI per cell group)
+2. **Calibration curve** — CRM points + I→C for the highlighted element/line; unknown as a star
+3. **Peak / background fit** — local baseline and fit for the highlighted spectrum and line
+4. **Concentration vs spectrum #** — checked elements across the Quant batch
 
-Series summary (mean / std / 95% CI across spectra) appears above the plots. **Export CSV…** writes per-spectrum mean, std, CI, and n_lines.
+Series summary appears above the plots. **Export CSV…** writes checked spectra/elements.
 
 ### Concentrations CSV format
 
@@ -128,7 +128,7 @@ CRM2,5.0,,18.4
 
 ### Method notes
 
-- Signal: local continuum subtract, then **Gaussian/Voigt fitted area** (default) with λ shift tolerance, or trapezoid **net area**
+- Signal: **SNIP** continuum (or edge linear/flat), then **Gaussian/Voigt fitted area** (default) with λ shift tolerance, or trapezoid **net area**
 - Overlaps: warned, not auto-rejected
 - Multi-line: average enabled lines that have a valid fit
 - Not included (yet): CF-LIBS / fundamental parameters, global λ recalibration, hard overlap rejection

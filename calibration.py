@@ -65,6 +65,17 @@ class CurveFit:
     intensities: list[float]
     concentrations: list[float]
     sample_ids: list[str]
+    #: If set, keep for Curves QC but exclude from Quant (e.g. "negative I→C slope")
+    rejected: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        return not self.rejected
+
+
+def usable_fits(cal: "CalibrationSet") -> list[CurveFit]:
+    """Fits eligible for Quant (non-rejected)."""
+    return [f for f in cal.fits if f.usable]
 
 
 @dataclass
@@ -74,6 +85,8 @@ class ElementPrediction:
     std: float | None
     n_lines: int
     line_predictions: list[tuple[float, float]]  # (wavelength_nm, C)
+    #: True if any line extrapolated below the I→C zero crossing (floored to 0)
+    below_calibration: bool = False
 
 
 @dataclass
@@ -134,8 +147,10 @@ class CalibrationSet:
     diagnostic_lines: list[DiagnosticLine] = field(default_factory=list)
     half_width_nm: float = 0.15
     baseline_pad_nm: float = 0.12
-    #: ``linear`` (edge-to-edge tilt) or ``flat`` (constant from edge strips)
-    baseline_method: str = "linear"
+    #: ``snip`` (default), ``linear`` (edge→edge), or ``flat`` (edge mean)
+    baseline_method: str = "snip"
+    #: SNIP peak-clipping iterations (RamanLab default 40)
+    snip_iterations: int = 40
     #: Peak intensity model: ``gaussian`` (default), ``voigt``, or ``net_area``
     peak_model: str = "gaussian"
     #: Allowed |fitted − NIST| shift when peak_model is gaussian/voigt
@@ -283,7 +298,34 @@ def convert_calibration_concentrations(
 # Signal extraction
 # ---------------------------------------------------------------------------
 
-BASELINE_METHODS: tuple[str, ...] = ("linear", "flat")
+BASELINE_METHODS: tuple[str, ...] = ("snip", "linear", "flat")
+
+
+def snip_baseline(y: np.ndarray, n_iter: int = 40) -> np.ndarray:
+    """
+    SNIP (Statistics-sensitive Non-linear Iterative Peak-clipping) baseline.
+
+    Ported from RamanLab ``peak_fitting_qt6._baseline_snip`` (Morháč LLS
+    transform + iterative clipping). Peaks are clipped downward toward the
+    continuum; the estimate cannot over-subtract above the data.
+    """
+    y = np.asarray(y, dtype=float)
+    if y.size < 3:
+        return y.copy()
+    n_iter = int(max(1, n_iter))
+    y_min = float(np.nanmin(y))
+    # Guard non-finite samples
+    y_work = np.nan_to_num(y, nan=y_min, posinf=y_min, neginf=y_min)
+    z = np.log(np.log(np.sqrt(y_work - y_min + 1.0) + 1.0) + 1.0)
+    for p in range(1, n_iter + 1):
+        if 2 * p >= len(z):
+            break
+        z_new = z.copy()
+        # Vectorized clip: z[i] ← min(z[i], mean of neighbors ±p)
+        z_new[p:-p] = np.minimum(z[p:-p], 0.5 * (z[:-2 * p] + z[2 * p :]))
+        z = z_new
+    background = (np.exp(np.exp(z) - 1.0) - 1.0) ** 2 + y_min - 1.0
+    return np.maximum(background, y_min)
 
 
 def _window_bounds(
@@ -322,25 +364,25 @@ def subtract_local_baseline(
     *,
     half_width_nm: float = 0.15,
     pad_nm: float = 0.12,
-    method: str = "linear",
+    method: str = "snip",
     edge_frac: float = 0.40,
+    snip_iterations: int = 40,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Local continuum from **narrow outer-edge** strips beside the peak.
+    Local continuum under a diagnostic line.
 
-    Window is ``center ± (half_width + pad)``. Baseline anchors use only the
-    outer ``edge_frac`` of each pad. Net area (see ``integrate_peak_area``)
-    covers everything **between** those strips so peak wings are not clipped.
+    Window is ``center ± (half_width + pad)``.
 
     ``method``:
-      - ``linear`` — line between left/right edge levels (default)
-      - ``flat`` — constant level from both edges
+      - ``snip`` — RamanLab SNIP peak-clipping (default; best for crowded LIBS)
+      - ``linear`` — line between left/right edge-strip levels
+      - ``flat`` — constant level from both edge strips
 
     Returns (wl_slice, intensity_corrected, baseline_on_slice).
     """
-    method = (method or "linear").strip().lower()
+    method = (method or "snip").strip().lower()
     if method not in BASELINE_METHODS:
-        method = "linear"
+        method = "snip"
 
     lo, hi, edge_w, _, _, _ = _window_bounds(
         center_nm, half_width_nm, pad_nm, edge_frac=edge_frac
@@ -352,6 +394,10 @@ def subtract_local_baseline(
 
     wl = np.asarray(wavelength_nm[mask], dtype=float)
     y = np.asarray(intensity[mask], dtype=float)
+
+    if method == "snip":
+        baseline = snip_baseline(y, n_iter=snip_iterations)
+        return wl, y - baseline, baseline
 
     left_edge = (wl >= lo) & (wl <= lo + edge_w)
     right_edge = (wl >= hi - edge_w) & (wl <= hi)
@@ -394,8 +440,9 @@ def integrate_peak_area(
     *,
     half_width_nm: float = 0.15,
     pad_nm: float = 0.12,
-    method: str = "linear",
+    method: str = "snip",
     edge_frac: float = 0.40,
+    snip_iterations: int = 40,
 ) -> float:
     """
     Net peak area (trapezoid) after local baseline subtraction.
@@ -414,6 +461,7 @@ def integrate_peak_area(
         pad_nm=pad_nm,
         method=method,
         edge_frac=edge_frac,
+        snip_iterations=snip_iterations,
     )
     if len(wl) < 2:
         return 0.0
@@ -494,10 +542,11 @@ def fit_emission_peak(
     *,
     half_width_nm: float = 0.15,
     pad_nm: float = 0.12,
-    baseline_method: str = "linear",
+    baseline_method: str = "snip",
     peak_model: str = "gaussian",
     shift_tol_nm: float = 0.15,
     edge_frac: float = 0.40,
+    snip_iterations: int = 40,
 ) -> PeakFitResult:
     """
     Fit a Gaussian or Voigt to the local baseline-corrected peak.
@@ -517,6 +566,7 @@ def fit_emission_peak(
         pad_nm=pad_nm,
         method=baseline_method,
         edge_frac=edge_frac,
+        snip_iterations=snip_iterations,
     )
 
     def _fallback(msg: str) -> PeakFitResult:
@@ -556,6 +606,7 @@ def fit_emission_peak(
         pad_nm=pad_nm,
         method=baseline_method,
         edge_frac=edge_frac,
+        snip_iterations=snip_iterations,
     )
     if len(wl_all) < 5:
         return _fallback("too few samples in window")
@@ -651,10 +702,11 @@ def extract_peak_intensity(
     *,
     half_width_nm: float = 0.15,
     pad_nm: float = 0.12,
-    baseline_method: str = "linear",
+    baseline_method: str = "snip",
     peak_model: str = "gaussian",
     shift_tol_nm: float = 0.15,
     edge_frac: float = 0.40,
+    snip_iterations: int = 40,
 ) -> float:
     """
     Peak intensity metric for I→C: fitted area (gaussian/voigt) or net area.
@@ -670,6 +722,7 @@ def extract_peak_intensity(
         peak_model=peak_model,
         shift_tol_nm=shift_tol_nm,
         edge_frac=edge_frac,
+        snip_iterations=snip_iterations,
     )
     return float(max(result.area, 0.0))
 
@@ -709,10 +762,11 @@ def peak_integration_view(
     *,
     half_width_nm: float = 0.15,
     pad_nm: float = 0.12,
-    method: str = "linear",
+    method: str = "snip",
     edge_frac: float = 0.40,
     peak_model: str = "gaussian",
     shift_tol_nm: float = 0.15,
+    snip_iterations: int = 40,
 ) -> PeakIntegrationView | None:
     """
     Return arrays for Peak QC: baseline, net span, and optional fitted profile.
@@ -737,6 +791,7 @@ def peak_integration_view(
         pad_nm=pad_nm,
         method=method,
         edge_frac=edge_frac,
+        snip_iterations=snip_iterations,
     )
     if len(wl) < 2:
         return None
@@ -750,6 +805,7 @@ def peak_integration_view(
         peak_model=peak_model,
         shift_tol_nm=shift_tol_nm,
         edge_frac=edge_frac,
+        snip_iterations=snip_iterations,
     )
     # Interpolate baseline onto the (possibly wider) display slice
     baseline_disp = np.interp(wl_raw, wl, baseline, left=baseline[0], right=baseline[-1])
@@ -793,7 +849,8 @@ def peak_net_height(
     *,
     half_width_nm: float = 0.15,
     pad_nm: float = 0.12,
-    method: str = "linear",
+    method: str = "snip",
+    snip_iterations: int = 40,
 ) -> float:
     """Net peak height at nearest sample after local baseline (secondary metric)."""
     wl, y_corr, _ = subtract_local_baseline(
@@ -803,6 +860,7 @@ def peak_net_height(
         half_width_nm=half_width_nm,
         pad_nm=pad_nm,
         method=method,
+        snip_iterations=snip_iterations,
     )
     if len(wl) == 0:
         return 0.0
@@ -865,60 +923,115 @@ def flag_line_overlaps(
     return out
 
 
+# Preferred CRM / LIBS calibrant wavelengths (nm), ordered best-first.
+# Prefer isolated / strong lines away from the Fe UV forest when possible
+# (e.g. Ca II IR triplet, K 766/770, Na D, Li 670).
+PREFERRED_CALIBRANT_LINES: dict[str, tuple[tuple[float, str], ...]] = {
+    "Ca": (
+        (854.209, "Ca II"),
+        (866.214, "Ca II"),
+        (849.802, "Ca II"),
+        (393.366, "Ca II"),
+        (396.847, "Ca II"),
+        (422.673, "Ca I"),
+    ),
+    "K": ((766.490, "K I"), (769.896, "K I")),
+    "Na": ((588.995, "Na I"), (589.592, "Na I")),
+    "Li": ((670.776, "Li I"), (610.354, "Li I")),
+    "Mg": (
+        (285.213, "Mg I"),
+        (279.553, "Mg II"),
+        (280.270, "Mg II"),
+        (518.360, "Mg I"),
+    ),
+    "Al": ((396.152, "Al I"), (394.401, "Al I")),
+    "Si": ((288.158, "Si I"), (251.611, "Si I"), (252.851, "Si I")),
+    "Sr": ((407.771, "Sr II"), (421.552, "Sr II")),
+    "Ba": ((455.403, "Ba II"), (493.408, "Ba II")),
+    "Cu": ((324.754, "Cu I"), (327.396, "Cu I")),
+    "Pb": (
+        (405.781, "Pb I"),
+        (368.346, "Pb I"),
+        (363.957, "Pb I"),
+        (280.200, "Pb I"),
+    ),
+    "Mn": ((403.076, "Mn I"), (279.482, "Mn II")),
+    "Cr": ((425.435, "Cr I"), (427.481, "Cr I"), (428.972, "Cr I")),
+    "Zn": ((481.053, "Zn I"), (472.215, "Zn I"), (213.857, "Zn I")),
+    "Fe": ((371.994, "Fe I"), (373.487, "Fe I"), (404.581, "Fe I")),
+    "O": ((777.194, "O I"), (844.636, "O I")),
+    "N": ((746.831, "N I"), (744.229, "N I"), (821.634, "N I")),
+    "H": ((656.280, "H"),),
+    "S": ((921.286, "S I"), (922.809, "S I"), (923.754, "S I")),
+    "P": ((253.399, "P I"), (255.328, "P I")),
+    "Ti": ((334.941, "Ti II"), (336.121, "Ti II"), (337.280, "Ti II")),
+}
+
+# How many lines Suggest offers per element by default.
+# 1 is enough for a curve; 2–4 supports multi-line mean + dropping bad λ.
+DEFAULT_SUGGEST_LINES_PER_ELEMENT = 4
+
+
+def _resolve_library_line(
+    library: list[LibraryLine],
+    element: str,
+    wavelength_nm: float,
+    *,
+    tol_nm: float = 0.05,
+) -> LibraryLine | None:
+    """Nearest library line for ``element`` within ``tol_nm``, else None."""
+    best: LibraryLine | None = None
+    best_d = float("inf")
+    for line in library:
+        if line.element != element:
+            continue
+        d = abs(float(line.wavelength_nm) - float(wavelength_nm))
+        if d <= tol_nm and d < best_d:
+            best = line
+            best_d = d
+    return best
+
+
 def suggest_diagnostic_lines(
     library: list[LibraryLine],
     elements: list[str],
     *,
     wl_min: float,
     wl_max: float,
-    max_per_element: int = 8,
+    max_per_element: int = 4,
     overlap_tol_nm: float = 0.12,
+    identify_matches: dict[str, list[tuple[float, str]]] | None = None,
 ) -> list[DiagnosticLine]:
-    """Strongest NIST lines per element in range, with overlap soft-flags."""
+    """
+    Smart diagnostic-line suggestions for CRM calibration.
+
+    Per element (up to ``max_per_element``, default 4):
+      1. Preferred calibrant λ (Ca II IR, K 766/770, …) in range
+      2. Identify-tab matches (strongest peaks first), if provided
+      3. Strongest remaining NIST I/II lines in range
+
+    One good line is enough for an I→C curve; 2–4 enabled lines give a
+    multi-line mean and let you drop bad λ after QC.
+    """
     from identify_elements import strong_library_lines
 
-    by_el = strong_library_lines(
-        library,
-        elements,
-        wl_min=wl_min,
-        wl_max=wl_max,
-        max_per_element=max_per_element,
-    )
+    max_n = max(1, int(max_per_element))
     lines: list[DiagnosticLine] = []
+
     for el in elements:
-        for L in by_el.get(el, []):
-            lines.append(
-                DiagnosticLine(
-                    element=el,
-                    wavelength_nm=float(L.wavelength_nm),
-                    species=L.species or el,
-                    enabled=True,
-                )
-            )
-    return flag_line_overlaps(lines, library, tol_nm=overlap_tol_nm)
-
-
-def seed_lines_from_matches(
-    matches_by_element: dict[str, list[tuple[float, str]]],
-    library: list[LibraryLine],
-    *,
-    max_per_element: int = 8,
-    overlap_tol_nm: float = 0.12,
-) -> list[DiagnosticLine]:
-    """
-    Build diagnostic lines from Identify matches.
-
-    ``matches_by_element`` maps element → list of (wavelength_nm, species).
-    """
-    lines: list[DiagnosticLine] = []
-    for el, pairs in matches_by_element.items():
+        chosen: list[DiagnosticLine] = []
         seen: set[float] = set()
-        for wl, species in pairs[:max_per_element]:
-            key = round(wl, 3)
+
+        def _add(wl: float, species: str) -> bool:
+            if len(chosen) >= max_n:
+                return False
+            key = round(float(wl), 3)
             if key in seen:
-                continue
+                return False
+            if float(wl) < wl_min - 0.05 or float(wl) > wl_max + 0.05:
+                return False
             seen.add(key)
-            lines.append(
+            chosen.append(
                 DiagnosticLine(
                     element=el,
                     wavelength_nm=float(wl),
@@ -926,7 +1039,74 @@ def seed_lines_from_matches(
                     enabled=True,
                 )
             )
+            return True
+
+        # 1) Preferred calibrants
+        for pref_wl, pref_sp in PREFERRED_CALIBRANT_LINES.get(el, ()):
+            if pref_wl < wl_min - 0.5 or pref_wl > wl_max + 0.5:
+                continue
+            hit = _resolve_library_line(library, el, pref_wl)
+            if hit is not None:
+                _add(hit.wavelength_nm, hit.species or pref_sp)
+            else:
+                _add(pref_wl, pref_sp)
+
+        # 2) Identify matches
+        if identify_matches:
+            for wl, species in identify_matches.get(el, []):
+                if len(chosen) >= max_n:
+                    break
+                hit = _resolve_library_line(library, el, float(wl), tol_nm=0.15)
+                if hit is not None:
+                    _add(hit.wavelength_nm, hit.species or species)
+                else:
+                    _add(float(wl), species or el)
+
+        # 3) Strong NIST fill (LIBS-diagnostic ranking)
+        if len(chosen) < max_n:
+            by_el = strong_library_lines(
+                library,
+                [el],
+                wl_min=wl_min,
+                wl_max=wl_max,
+                max_per_element=max(max_n * 3, 12),
+                libs_diagnostics=True,
+            )
+            for L in by_el.get(el, []):
+                if len(chosen) >= max_n:
+                    break
+                _add(float(L.wavelength_nm), L.species or el)
+
+        lines.extend(chosen)
+
     return flag_line_overlaps(lines, library, tol_nm=overlap_tol_nm)
+
+
+def seed_lines_from_matches(
+    matches_by_element: dict[str, list[tuple[float, str]]],
+    library: list[LibraryLine],
+    *,
+    max_per_element: int = 4,
+    overlap_tol_nm: float = 0.12,
+    wl_min: float = 180.0,
+    wl_max: float = 1022.0,
+) -> list[DiagnosticLine]:
+    """
+    Build diagnostic lines from Identify matches, preferring calibrant λ.
+
+    Thin wrapper around ``suggest_diagnostic_lines`` so Suggest lines and
+    Identify seeding share one policy.
+    """
+    elements = list(matches_by_element.keys())
+    return suggest_diagnostic_lines(
+        library,
+        elements,
+        wl_min=wl_min,
+        wl_max=wl_max,
+        max_per_element=max_per_element,
+        overlap_tol_nm=overlap_tol_nm,
+        identify_matches=matches_by_element,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1075,6 +1255,7 @@ def build_fits(
                     baseline_method=cal.baseline_method,
                     peak_model=cal.peak_model,
                     shift_tol_nm=cal.shift_tol_nm,
+                    snip_iterations=cal.snip_iterations,
                 )
             except Exception as exc:
                 _note(f"{label}: integration failed on {std.sample_id} ({exc})")
@@ -1128,16 +1309,114 @@ def build_fits(
                 "check peak areas and concentrations)"
             )
             continue
+        if fit_response_slope(fit) < 0.0:
+            # Keep the curve for QC plots so you can see inverted CRM points;
+            # Quant will ignore rejected fits (do not add to ``skipped``).
+            fit.rejected = "negative I→C slope"
         fits.append(fit)
 
     cal.fits = fits
     return fits
 
 
+def fit_response_slope(fit: CurveFit) -> float:
+    """
+    Local dC/dI of the calibration polynomial at the mean CRM intensity.
+
+    Negative means the curve is physically unusable for quantification.
+    """
+    coeffs = np.asarray(fit.coeffs, dtype=float)
+    if coeffs.size == 0:
+        return float("nan")
+    xs = np.asarray(fit.intensities, dtype=float)
+    xs = xs[np.isfinite(xs)]
+    x0 = float(np.mean(xs)) if len(xs) else 0.0
+    # Derivative of np.polyval(coeffs, x)
+    if coeffs.size == 1:
+        return 0.0
+    dcoeffs = np.polyder(coeffs)
+    return float(np.polyval(dcoeffs, x0))
+
+
 def predict_from_fit(fit: CurveFit, intensity: float) -> float:
     """Evaluate I→C curve; concentrations below zero are floored to 0."""
+    c, _ = predict_from_fit_ex(fit, intensity)
+    return c
+
+
+def predict_from_fit_ex(fit: CurveFit, intensity: float) -> tuple[float, bool]:
+    """
+    Evaluate I→C curve.
+
+    Returns ``(concentration, below_calibration)``. When the linear/quadratic
+    model yields C < 0 (intensity below the curve’s zero-crossing), concentration
+    is floored to 0 and ``below_calibration`` is True.
+    """
     c = float(np.polyval(fit.coeffs, intensity))
-    return 0.0 if c < 0.0 else c
+    if not np.isfinite(c):
+        return 0.0, True
+    if c < 0.0:
+        return 0.0, True
+    return c, False
+
+
+def intensity_zero_crossing(fit: CurveFit) -> float | None:
+    """Peak area where the linear I→C model crosses C = 0 (None if N/A)."""
+    coeffs = np.asarray(fit.coeffs, dtype=float)
+    if coeffs.size < 2 or fit.degree != 1:
+        return None
+    slope, intercept = float(coeffs[0]), float(coeffs[1])
+    if abs(slope) < 1e-18:
+        return None
+    i0 = -intercept / slope
+    return float(i0) if np.isfinite(i0) else None
+
+
+def _spectrum_matches_standard(unknown: Spectrum, std: StandardSample) -> bool:
+    """True if ``unknown`` is the same file as a CRM standard."""
+    try:
+        up = unknown.meta.path.resolve()
+        sp = std.path.resolve()
+        if up == sp:
+            return True
+    except OSError:
+        pass
+    return unknown.meta.path.name == std.path.name
+
+
+def intensity_for_prediction(
+    cal: CalibrationSet,
+    fit: CurveFit,
+    unknown: Spectrum,
+) -> tuple[float, bool]:
+    """
+    Peak intensity for I→C on ``unknown``.
+
+    If ``unknown`` is one of the CRM spectra that built ``fit``, reuse the
+    stored calibration intensity so Quant of a standard recovers the
+    certificate point. Otherwise extract with current cal peak params.
+
+    Returns ``(intensity, reused_from_crm)``.
+    """
+    for sid, stored in zip(fit.sample_ids, fit.intensities):
+        if not np.isfinite(stored):
+            continue
+        for std in cal.standards:
+            if std.sample_id != sid:
+                continue
+            if _spectrum_matches_standard(unknown, std):
+                return float(stored), True
+    inten = extract_peak_intensity(
+        unknown,
+        fit.wavelength_nm,
+        half_width_nm=cal.half_width_nm,
+        pad_nm=cal.baseline_pad_nm,
+        baseline_method=cal.baseline_method,
+        peak_model=cal.peak_model,
+        shift_tol_nm=cal.shift_tol_nm,
+        snip_iterations=cal.snip_iterations,
+    )
+    return float(inten), False
 
 
 def predict_with_intensities(
@@ -1150,6 +1429,8 @@ def predict_with_intensities(
     Apply fitted curves to an unknown; return predictions and per-line intensities.
 
     Intensities are keyed by ``(element, wavelength_nm)`` matching ``cal.fits``.
+    CRM spectra used to build the curves reuse their stored peak areas so
+    Quant of a calibration file lands on the certificate point.
     """
     if not cal.fits:
         build_fits(cal)
@@ -1158,21 +1439,16 @@ def predict_with_intensities(
     report_set = set(report)
 
     by_el: dict[str, list[tuple[float, float]]] = {}
+    below_el: dict[str, bool] = {}
     intensities: dict[tuple[str, float], float] = {}
-    for fit in cal.fits:
+    for fit in usable_fits(cal):
         if fit.element not in report_set:
             continue
-        inten = extract_peak_intensity(
-            unknown,
-            fit.wavelength_nm,
-            half_width_nm=cal.half_width_nm,
-            pad_nm=cal.baseline_pad_nm,
-            baseline_method=cal.baseline_method,
-            peak_model=cal.peak_model,
-            shift_tol_nm=cal.shift_tol_nm,
-        )
-        c = predict_from_fit(fit, inten)
+        inten, _reused = intensity_for_prediction(cal, fit, unknown)
+        c, below = predict_from_fit_ex(fit, inten)
         by_el.setdefault(fit.element, []).append((fit.wavelength_nm, c))
+        if below:
+            below_el[fit.element] = True
         intensities[(fit.element, float(fit.wavelength_nm))] = float(inten)
 
     preds: list[ElementPrediction] = []
@@ -1192,6 +1468,7 @@ def predict_with_intensities(
                 std=std,
                 n_lines=len(vals),
                 line_predictions=pairs,
+                below_calibration=bool(below_el.get(el, False)),
             )
         )
     return preds, intensities
@@ -1405,6 +1682,7 @@ def calibration_set_to_dict(cal: CalibrationSet) -> dict:
         "half_width_nm": cal.half_width_nm,
         "baseline_pad_nm": cal.baseline_pad_nm,
         "baseline_method": cal.baseline_method,
+        "snip_iterations": cal.snip_iterations,
         "peak_model": cal.peak_model,
         "shift_tol_nm": cal.shift_tol_nm,
         "overlap_tol_nm": cal.overlap_tol_nm,
@@ -1445,6 +1723,7 @@ def calibration_set_to_dict(cal: CalibrationSet) -> dict:
                 "intensities": f.intensities,
                 "concentrations": f.concentrations,
                 "sample_ids": f.sample_ids,
+                "rejected": f.rejected,
             }
             for f in cal.fits
         ],
@@ -1471,10 +1750,11 @@ def load_calibration_set(path: Path) -> CalibrationSet:
         baseline_pad_nm=float(data.get("baseline_pad_nm", 0.12)),
         baseline_method=(
             m
-            if (m := str(data.get("baseline_method") or "linear").strip().lower())
-            in ("linear", "flat")
-            else "linear"
+            if (m := str(data.get("baseline_method") or "snip").strip().lower())
+            in BASELINE_METHODS
+            else "snip"
         ),
+        snip_iterations=int(data.get("snip_iterations", 40)),
         peak_model=_normalize_peak_model(str(data.get("peak_model") or "gaussian")),
         shift_tol_nm=float(data.get("shift_tol_nm", 0.15)),
         overlap_tol_nm=float(data.get("overlap_tol_nm", 0.12)),
@@ -1521,6 +1801,7 @@ def load_calibration_set(path: Path) -> CalibrationSet:
                 intensities=[float(x) for x in f.get("intensities") or []],
                 concentrations=[float(x) for x in f.get("concentrations") or []],
                 sample_ids=list(f.get("sample_ids") or []),
+                rejected=(str(r) if (r := f.get("rejected")) else None),
             )
         )
     return cal
