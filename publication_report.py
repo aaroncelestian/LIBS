@@ -1,19 +1,21 @@
 """
-Publication figures: for each identified element, plot its strongest matched lines
-in separate zoomed windows (up to 5).
+LIBS identification report as a Word (.docx) document.
+
+For each ranked element: tabulated values plus spectra of the two most intense
+matched lines.
 
 Example (CLI):
-  .venv/bin/python publication_report.py docs/stone-9b.txt -o reports/stone-9b.pdf
+  .venv/bin/python publication_report.py path/to/spectrum.txt -o reports/out.docx
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 
 from identify_elements import (
@@ -30,6 +32,9 @@ from matplotlib_config import apply_matplotlib_config
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_LIBRARY = ROOT / "nist_lines" / "libs_line_library.csv"
+
+# Fixed report content: two strongest matched lines per element
+REPORT_N_LINES = 2
 
 
 def strongest_matches(hit: ElementHit, n: int = 5) -> list[Match]:
@@ -137,7 +142,6 @@ def plot_element_line_panels(
         )
         ax.set_xlabel("Wavelength (nm)")
         ax.set_xlim(center - half_width_nm, center + half_width_nm)
-        # Local y-scale with a little headroom
         y_hi = float(np.max(y)) if len(y) else m.peak.intensity
         y_lo = float(np.min(y)) if len(y) else 0.0
         pad = 0.08 * (y_hi - y_lo + 1.0)
@@ -150,19 +154,49 @@ def plot_element_line_panels(
     return fig
 
 
-def export_element_report_pdf(
+def _fig_to_png_bytes(fig: Figure, *, dpi: int = 160) -> bytes:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _line_value_cell(m: Match | None) -> str:
+    if m is None:
+        return "—"
+    nist = (
+        f" NIST I={m.line.intensity:.0f}"
+        if m.line.intensity is not None
+        else ""
+    )
+    return (
+        f"{m.line.species} {m.peak.wavelength_nm:.3f} nm\n"
+        f"I={m.peak.intensity:.0f}  Δλ={m.delta_nm:+.3f} nm{nist}"
+    )
+
+
+def export_element_report_docx(
     spectrum: Spectrum,
     hits: list[ElementHit],
     out_path: Path,
     *,
-    n_lines: int = 5,
     half_width_nm: float = 1.5,
     atmosphere: str | None = None,
     max_elements: int | None = None,
 ) -> Path:
     """
-    Write a multipage PDF: one page per element with up to ``n_lines`` zoomed panels.
+    Write a Word document: element value table + two strongest-line spectra each.
     """
+    try:
+        from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.shared import Inches, Pt
+    except ImportError as exc:
+        raise ImportError(
+            "python-docx is required for Word reports. "
+            "Install with: pip install python-docx"
+        ) from exc
+
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     selected = hits if max_elements is None else hits[:max_elements]
@@ -170,176 +204,141 @@ def export_element_report_pdf(
         raise ValueError("No elements to export — run Find peaks + match first.")
 
     apply_matplotlib_config()
-    with PdfPages(out_path) as pdf:
-        # Cover / summary page
-        fig_sum = _summary_figure(spectrum, selected, atmosphere=atmosphere)
-        pdf.savefig(fig_sum, bbox_inches="tight")
-        plt.close(fig_sum)
+    doc = Document()
 
-        for hit in selected:
-            fig = plot_element_line_panels(
-                spectrum,
-                hit,
-                n_lines=n_lines,
-                half_width_nm=half_width_nm,
-                atmosphere=atmosphere,
-            )
-            pdf.savefig(fig, bbox_inches="tight")
-            plt.close(fig)
+    title = doc.add_heading("LIBS element identification report", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
-    return out_path
-
-
-def export_element_report_pngs(
-    spectrum: Spectrum,
-    hits: list[ElementHit],
-    out_dir: Path,
-    *,
-    n_lines: int = 5,
-    half_width_nm: float = 1.5,
-    atmosphere: str | None = None,
-    max_elements: int | None = None,
-    dpi: int = 200,
-) -> list[Path]:
-    """Save one PNG per element into ``out_dir``."""
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    selected = hits if max_elements is None else hits[:max_elements]
-    paths: list[Path] = []
-    for hit in selected:
-        fig = plot_element_line_panels(
-            spectrum,
-            hit,
-            n_lines=n_lines,
-            half_width_nm=half_width_nm,
-            atmosphere=atmosphere,
-        )
-        path = out_dir / f"{spectrum.meta.path.stem}_{hit.element}_lines.png"
-        fig.savefig(path, dpi=dpi, bbox_inches="tight")
-        plt.close(fig)
-        paths.append(path)
-    return paths
-
-
-def _summary_figure(
-    spectrum: Spectrum,
-    hits: list[ElementHit],
-    *,
-    atmosphere: str | None = None,
-) -> Figure:
-    apply_matplotlib_config()
-    fig, ax = plt.subplots(figsize=(8.5, 11))
-    ax.axis("off")
     m = spectrum.meta
     atm = atmosphere or "—"
-    lines = [
-        "LIBS element identification report",
-        "",
-        f"Sample:        {m.path.name}",
-        f"Config:        {m.cfg_path.name if m.cfg_path else '—'}",
-        f"Atmosphere:    {atm}",
+    meta_lines = [
+        f"Sample: {m.path.name}",
+        f"Config: {m.cfg_path.name if m.cfg_path else '—'}",
+        f"Atmosphere: {atm}",
     ]
     if m.laser_energy_mJ is not None:
-        lines.append(f"Laser:         {m.laser_energy_mJ:g} mJ")
+        meta_lines.append(f"Laser: {m.laser_energy_mJ:g} mJ")
     if m.qs_delay_us is not None:
-        lines.append(f"QS delay:      {m.qs_delay_us:g} µs")
+        meta_lines.append(f"QS delay: {m.qs_delay_us:g} µs")
     if m.integration_time_us is not None:
         delay = (
             f", delay {m.integration_delay_us:g} µs"
             if m.integration_delay_us is not None
             else ""
         )
-        lines.append(f"Gate:          {m.integration_time_us:g} µs{delay}")
+        meta_lines.append(f"Gate: {m.integration_time_us:g} µs{delay}")
     if m.n_accumulations is not None:
-        lines.append(f"Accumulations: {m.n_accumulations}")
+        meta_lines.append(f"Accumulations: {m.n_accumulations}")
     wl0 = float(spectrum.wavelength_nm.min())
     wl1 = float(spectrum.wavelength_nm.max())
-    lines.append(f"Range:         {wl0:.2f}–{wl1:.2f} nm")
-    lines += [
-        "",
-        "Ranked elements (confidence = ID strength, not concentration)",
-        "",
-        f"{'#':<4} {'El':<6} {'Peaks':>6} {'Conf %':>8}",
-        "-" * 28,
-    ]
-    for i, hit in enumerate(hits, start=1):
-        lines.append(
-            f"{i:<4} {hit.element:<6} {hit.n_peaks:>6} {hit.confidence:>7.0f}%"
-        )
-    lines += [
-        "",
-        "Following pages: up to 5 strongest matched lines per element.",
-        "Solid red = observed peak; dashed green = NIST wavelength.",
-    ]
-    ax.text(
-        0.08,
-        0.95,
-        "\n".join(lines),
-        transform=ax.transAxes,
-        va="top",
-        ha="left",
-        family="monospace",
-        fontsize=10,
+    meta_lines.append(f"Range: {wl0:.2f}–{wl1:.2f} nm")
+
+    for line in meta_lines:
+        p = doc.add_paragraph(line)
+        p.paragraph_format.space_after = Pt(0)
+
+    doc.add_paragraph()
+    doc.add_heading("Element values", level=1)
+    note = doc.add_paragraph(
+        "Confidence is identification strength (not concentration). "
+        "Line 1 / Line 2 are the two most intense matched peaks."
     )
-    fig.tight_layout()
-    return fig
+    note.runs[0].italic = True
+
+    table = doc.add_table(rows=1, cols=5)
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    hdr[0].text = "Element"
+    hdr[1].text = "Peaks"
+    hdr[2].text = "Conf %"
+    hdr[3].text = "Line 1 (most intense)"
+    hdr[4].text = "Line 2"
+
+    for hit in selected:
+        top = strongest_matches(hit, n=REPORT_N_LINES)
+        row = table.add_row().cells
+        row[0].text = hit.element
+        row[1].text = str(hit.n_peaks)
+        row[2].text = f"{hit.confidence:.0f}"
+        row[3].text = _line_value_cell(top[0] if len(top) > 0 else None)
+        row[4].text = _line_value_cell(top[1] if len(top) > 1 else None)
+
+    doc.add_paragraph()
+    doc.add_heading("Spectra — two strongest lines per element", level=1)
+    legend = doc.add_paragraph(
+        "Solid red = observed peak; dashed green = NIST wavelength."
+    )
+    legend.runs[0].italic = True
+
+    for hit in selected:
+        top = strongest_matches(hit, n=REPORT_N_LINES)
+        doc.add_heading(
+            f"{hit.element}  ·  {hit.n_peaks} peaks  ·  {hit.confidence:.0f}% conf",
+            level=2,
+        )
+        vals = doc.add_paragraph()
+        if top:
+            bits = [
+                f"{m.line.species} {m.peak.wavelength_nm:.3f} nm (I={m.peak.intensity:.0f})"
+                for m in top
+            ]
+            vals.add_run(" · ".join(bits))
+        else:
+            vals.add_run("No matched lines.")
+
+        fig = plot_element_line_panels(
+            spectrum,
+            hit,
+            n_lines=REPORT_N_LINES,
+            half_width_nm=half_width_nm,
+            atmosphere=atmosphere,
+        )
+        png = _fig_to_png_bytes(fig)
+        doc.add_picture(io.BytesIO(png), width=Inches(6.5))
+
+    doc.save(out_path)
+    return out_path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export LIBS publication line-panel report")
+    parser = argparse.ArgumentParser(
+        description="Export LIBS identification report as a Word (.docx) file"
+    )
     parser.add_argument("spectrum", type=Path)
     parser.add_argument(
         "-o",
         "--output",
         type=Path,
         default=None,
-        help="Output PDF path (default: reports/<stem>_lines.pdf)",
+        help="Output DOCX path (default: reports/<stem>_lines.docx)",
     )
     parser.add_argument("--library", type=Path, default=DEFAULT_LIBRARY)
     parser.add_argument("--tol-nm", type=float, default=0.12)
-    parser.add_argument("--prominence-frac", type=float, default=0.015)
-    parser.add_argument("--half-width-nm", type=float, default=1.5)
-    parser.add_argument("--n-lines", type=int, default=5)
-    parser.add_argument("--max-elements", type=int, default=None)
+    parser.add_argument("--prominence", type=float, default=0.015)
+    parser.add_argument("--half-width", type=float, default=1.5)
     parser.add_argument("--atmosphere", type=str, default=None)
+    parser.add_argument("--max-elements", type=int, default=None)
     args = parser.parse_args()
 
     spectrum = load_spectrum(args.spectrum)
     library = load_line_library(args.library)
-    peaks = find_spectrum_peaks(spectrum, min_prominence_frac=args.prominence_frac)
-    support: dict[str, float] = {}
-    primary: dict[str, bool] = {}
-    primary_wl: dict[str, float] = {}
-    matches = match_peaks(
-        peaks,
-        library,
-        tol_nm=args.tol_nm,
-        diagnostic_support_out=support,
-        primary_diagnostic_out=primary,
-        primary_wavelength_out=primary_wl,
-    )
-    hits = score_elements(
-        matches,
-        min_peaks=2,
-        diagnostic_support=support,
-        primary_diagnostic=primary,
-        primary_wavelength=primary_wl,
-    )
+    peaks = find_spectrum_peaks(spectrum, min_prominence_frac=args.prominence)
+    matches = match_peaks(peaks, library, tol_nm=args.tol_nm)
+    hits = score_elements(matches, min_peaks=2)
 
     out = args.output
     if out is None:
-        out = ROOT / "reports" / f"{spectrum.meta.path.stem}_lines.pdf"
+        out = ROOT / "reports" / f"{spectrum.meta.path.stem}_lines.docx"
 
-    path = export_element_report_pdf(
+    path = export_element_report_docx(
         spectrum,
         hits,
         out,
-        n_lines=args.n_lines,
-        half_width_nm=args.half_width_nm,
+        half_width_nm=args.half_width,
         atmosphere=args.atmosphere,
         max_elements=args.max_elements,
     )
-    print(f"Wrote {path}  ({min(len(hits), args.max_elements or len(hits))} element pages)")
+    print(f"Wrote {path}")
 
 
 if __name__ == "__main__":

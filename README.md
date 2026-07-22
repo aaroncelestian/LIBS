@@ -9,7 +9,7 @@ Interactive tools for Laser-Induced Breakdown Spectroscopy (LIBS): load spectra,
 - Ranked element list with candidate lines per peak
 - Interactive GUI (click peaks, add weak lines manually)
 - Multi-file load: Single / Waterfall / Working modes, Mean/Sum, bulk match & CRM Quant
-- Publication PDF report (strongest matched lines per element)
+- Word (.docx) identification report (element values + two strongest-line spectra)
 - Atmosphere tag (air / argon)
 - **Calibrate** tab: CRM standards → diagnostic lines → intensity→concentration curves
 - **Quant** tab: apply CRM fits to unknowns — results table (std / 95% CI), unknown on I→C curve, peak QC, C vs spectrum #
@@ -22,7 +22,27 @@ Easiest — one command (creates `.venv`, installs deps; prompts to download NIS
 python3 install.py
 ```
 
-Options: `python3 install.py --skip-nist` · `python3 install.py --force-nist` · `python3 install.py --venv .venv`
+Options: `python3 install.py --skip-nist` · `python3 install.py --force-nist` · `python3 install.py --venv .venv` · `python3 install.py --online`
+
+### Offline / air-gapped Windows lab PCs
+
+Those machines cannot reach PyPI. Bundle wheels on a connected PC first:
+
+```bash
+# Match the lab Python (Anaconda log showed 3.12) and Windows x64:
+python download_wheels.py --platform win_amd64 --python 3.12
+```
+
+Copy the **entire** LIBS folder (including `wheels/` and `nist_lines/`) to the lab PC, then:
+
+```powershell
+cd C:\LIBS\LIBS
+python install.py
+```
+
+`install.py` detects `wheels/` and installs with `--no-index` (no internet). NIST is already shipped under `nist_lines/` when present.
+
+**Windows note:** if you see `getaddrinfo failed` with an empty `wheels/` folder, the PC is offline — run `download_wheels.py` elsewhere and re-copy.
 
 Or manually:
 
@@ -68,7 +88,7 @@ Open several `.txt` files at once (or **Add spectra** / drag-and-drop). The left
 | **Working only** | Active spectrum only (a single file, or Mean/Sum combine). |
 
 - **Mean / Sum** — combine checked rows, add the result to the Spectra list (e.g. `sum_of_11.txt`), and make it active. **Export sum…** writes that result to disk and lists the saved file.
-- **Bulk match** — Find peaks + NIST match on each checked file; review with Single + Prev/Next (`· matched` in the list).
+- **Match** — Find peaks + NIST match on each **checked** file (or highlighted rows if none checked); review with Single + Prev/Next (`· matched` in the list). Waterfall mode switches to Single so rankings/peaks are visible.
 - **Quant** — applies **existing Calibrate-tab CRM fits** to each checked spectrum (does not rebuild curves). Results open on the **Quant** tab.
 
 Opening multiple files stays on **Single** (first spectrum); it does **not** auto-mean.
@@ -80,12 +100,13 @@ python identify_elements.py path/to/spectrum.txt
 python identify_elements.py path/to/spectrum.txt --plot
 ```
 
-### Publication report
+### Identification report
 
 ```bash
-python publication_report.py path/to/spectrum.txt -o reports/out.pdf
+python publication_report.py path/to/spectrum.txt -o reports/out.docx
 ```
 
+Exports a Word document: table of element values, then spectra of the two most intense matched lines per element.
 ## Calibration (CRM univariate)
 
 On the **Calibrate** tab:
@@ -144,7 +165,7 @@ Match acquisition conditions (gate, laser energy, atmosphere) across standards a
 | `calibration_gui.py` | Calibrate tab UI |
 | `quant_gui.py` | Quant tab UI (results, curve overlay, peak QC, series plot) |
 | `identify_elements.py` | Peak finding and NIST matching |
-| `publication_report.py` | PDF figures of strongest matched lines |
+| `publication_report.py` | Word (.docx) ID report (values + 2 strongest lines) |
 | `download_nist_lines.py` | Fetch / build the NIST line library |
 | `matplotlib_config.py` | Shared matplotlib styling |
 | `nist_lines/` | Downloaded line library (CSV) |

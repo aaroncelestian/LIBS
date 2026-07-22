@@ -7,15 +7,17 @@ Features:
   - Single / Waterfall / Working display modes
   - Prev/Next navigation; sum / mean multi-spot shots on the same sample
   - Quant button: CRM quantification of checked/highlighted spectra → Quant tab
+  - Find peaks + match on all checked (or highlighted) spectra when multiple files are loaded
   - Plot full spectrum with detected peaks
   - Run NIST search/match; ranked element list
   - Multi-select elements to preview NIST stick spectra
-  - Browse NIST tab: periodic table + catalog lines (click view / double-click pin);
+  - Browse NIST tab: periodic table + catalog lines (click view / double-click pin;
+    right-click add/remove from identified list);
     Match auto-pins Overlay (default top 5) on the plot
   - Top-5 intense matched-line preview window (double-click element / Ctrl+L)
   - Click near a peak to list candidate elements/lines
   - Manually add weak peaks (Shift/right-click) into the match
-  - Export publication report (≤5 strongest lines per element)
+  - Export Word (.docx) identification report (element values + two strongest-line spectra)
   - Atmosphere tag (air / argon)
   - Calibrate tab: CRM univariate standards calibration (I → C)
   - Quant tab: results with std/CI, unknown on I→C curve, peak QC, C vs spectrum #
@@ -182,6 +184,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSizePolicy,
@@ -224,8 +227,8 @@ from identify_elements import (
 )
 from matplotlib_config import apply_matplotlib_config
 from publication_report import (
-    export_element_report_pdf,
-    export_element_report_pngs,
+    REPORT_N_LINES,
+    export_element_report_docx,
     plot_element_line_panels,
 )
 from quant_gui import QuantTab
@@ -278,7 +281,7 @@ _PERIODIC_LAYOUT: tuple[tuple[str, int, int], ...] = (
 
 
 class _ElementCell(QPushButton):
-    """Tiny periodic-table cell: click = view, double-click = pin toggle."""
+    """Tiny periodic-table cell: click = view, double-click = pin, right-click = add/remove ID."""
 
     def __init__(self, symbol: str, parent: QWidget | None = None) -> None:
         super().__init__(symbol, parent)
@@ -290,6 +293,8 @@ class _ElementCell(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
         self._apply_style()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
@@ -297,6 +302,19 @@ class _ElementCell(QPushButton):
         if isinstance(parent, PeriodicTableWidget) and self._available:
             parent.elementPinToggled.emit(self.symbol)
         super().mouseDoubleClickEvent(event)
+
+    def _on_context_menu(self, pos) -> None:
+        parent = self.parent()
+        if not isinstance(parent, PeriodicTableWidget) or not self._available:
+            return
+        menu = QMenu(self)
+        add_act = menu.addAction(f"Add {self.symbol} to identified elements")
+        rem_act = menu.addAction(f"Remove {self.symbol} from identified elements")
+        chosen = menu.exec(self.mapToGlobal(pos))
+        if chosen is add_act:
+            parent.elementAddToHits.emit(self.symbol)
+        elif chosen is rem_act:
+            parent.elementRemoveFromHits.emit(self.symbol)
 
     def set_available(self, available: bool) -> None:
         self._available = available
@@ -337,11 +355,14 @@ class PeriodicTableWidget(QWidget):
     Mini periodic table for Browse NIST.
 
     Single-click → view element lines. Double-click → pin/unpin for stick overlay.
+    Right-click → add/remove from the Element ranking (identified) list.
     After Match, only the Overlay combo (default top 5) are auto-pinned.
     """
 
     elementViewed = Signal(str)
     elementPinToggled = Signal(str)
+    elementAddToHits = Signal(str)
+    elementRemoveFromHits = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -358,9 +379,10 @@ class PeriodicTableWidget(QWidget):
             cell = _ElementCell(symbol, self)
             cell.clicked.connect(lambda checked=False, s=symbol: self._on_cell_clicked(s))
             cell.setToolTip(
-                f"{symbol}\nClick to view NIST lines\n"
-                "Double-click to pin / unpin on the plot "
-                "(syncs with matched list; Match pins Overlay only)"
+                f"{symbol}\n"
+                "Click to view NIST lines\n"
+                "Double-click to pin / unpin on the plot\n"
+                "Right-click to add / remove from identified elements"
             )
             cell.set_available(False)
             grid.addWidget(cell, row, col)
@@ -660,7 +682,7 @@ class LinePreviewWindow(QDialog):
 
 
 class ReportExportDialog(QDialog):
-    """Options for multipage PDF / PNG publication figures."""
+    """Options for Word (.docx) identification report."""
 
     def __init__(
         self,
@@ -672,7 +694,7 @@ class ReportExportDialog(QDialog):
         spectrum_label: str,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Export publication report")
+        self.setWindowTitle("Export identification report")
         self._stem = default_stem
 
         form = QFormLayout(self)
@@ -696,15 +718,9 @@ class ReportExportDialog(QDialog):
         sel_label = "Selected element(s)"
         self.combo_scope.addItem(sel_label, "selected")
         if not has_selection:
-            # still listed but user gets a clear empty warning if chosen without selection
             idx = self.combo_scope.findData("selected")
             self.combo_scope.model().item(idx).setEnabled(False)
         form.addRow("Elements", self.combo_scope)
-
-        self.spin_lines = QSpinBox()
-        self.spin_lines.setRange(1, 5)
-        self.spin_lines.setValue(5)
-        form.addRow("Lines per element", self.spin_lines)
 
         self.spin_half = QDoubleSpinBox()
         self.spin_half.setRange(0.3, 10.0)
@@ -712,19 +728,13 @@ class ReportExportDialog(QDialog):
         self.spin_half.setDecimals(2)
         self.spin_half.setValue(1.50)
         self.spin_half.setSuffix(" nm")
-        form.addRow("Window ± half-width", self.spin_half)
-
-        self.combo_fmt = QComboBox()
-        self.combo_fmt.addItem("PDF (multipage, one element per page)", "pdf")
-        self.combo_fmt.addItem("PNG folder (one figure per element)", "png")
-        form.addRow("Format", self.combo_fmt)
+        form.addRow("Spectrum window ±", self.spin_half)
 
         hint = QLabel(
-            "Uses the Working spectrum shown above (and its match cache).\n"
-            "Each page shows up to 5 strongest matched lines in separate zoomed panels.\n"
+            "Word (.docx) report: table of element values, then for each\n"
+            f"element the spectra of the {REPORT_N_LINES} most intense matched lines.\n"
             "Solid red = observed peak; dashed green = NIST λ.\n"
-            "Default file name stem: "
-            f"{default_stem}_lines.pdf"
+            f"Default file: {default_stem}_lines.docx"
         )
         hint.setStyleSheet("color: #555;")
         hint.setWordWrap(True)
@@ -740,9 +750,7 @@ class ReportExportDialog(QDialog):
     def options(self) -> dict:
         return {
             "scope": self.combo_scope.currentData(),
-            "n_lines": int(self.spin_lines.value()),
             "half_width_nm": float(self.spin_half.value()),
-            "format": self.combo_fmt.currentData(),
             "stem": self._stem,
         }
 
@@ -836,11 +844,13 @@ class LibsExplorerWindow(QMainWindow):
         )
         self.act_export_spectrum.triggered.connect(self.export_working_spectrum)
 
-        self.act_bulk_match = QAction("Bulk match checked…", self)
+        self.act_bulk_match = QAction("Match selected spectra…", self)
         self.act_bulk_match.setToolTip(
-            "Bulk match checked\nRun Find peaks + match on each checked spectrum."
+            "Match selected spectra\n"
+            "Find peaks + NIST match on each checked spectrum\n"
+            "(or highlighted rows if none are checked)."
         )
-        self.act_bulk_match.triggered.connect(self.bulk_match_checked)
+        self.act_bulk_match.triggered.connect(self.run_match)
 
         self.act_bulk_quant = QAction("Quant selected…", self)
         self.act_bulk_quant.setToolTip(
@@ -851,8 +861,11 @@ class LibsExplorerWindow(QMainWindow):
 
         self.act_match = QAction(_icon_match(), "Find peaks + match", self)
         self.act_match.setToolTip(
-            "Find peaks + match\nDetect peaks and match them to the NIST line library.\n"
-            "Pins Overlay elements on the plot (default: top 5 by confidence)."
+            "Find peaks + match\n"
+            "Detect peaks and match them to the NIST library.\n"
+            "With multiple files: runs on all checked spectra\n"
+            "(or highlighted rows if none checked), then shows the active file.\n"
+            "Pins Overlay elements on the plot (default: top 5)."
         )
         self.act_match.triggered.connect(self.run_match)
 
@@ -897,9 +910,9 @@ class LibsExplorerWindow(QMainWindow):
         self.act_report = QAction(_icon_report(), "Export report…", self)
         self.act_report.setShortcut(QKeySequence("Ctrl+R"))
         self.act_report.setToolTip(
-            "Export publication report… (Ctrl+R)\n"
-            "PDF/PNG figures for the active Working spectrum only\n"
-            "(use Prev/Next or View to choose which loaded file)."
+            "Export identification report… (Ctrl+R)\n"
+            "Word (.docx): element values + spectra of the two most intense lines\n"
+            "for the active Working spectrum only."
         )
         self.act_report.triggered.connect(self.export_publication_report)
 
@@ -1214,8 +1227,12 @@ class LibsExplorerWindow(QMainWindow):
 
         bulk_btns = QHBoxLayout()
         btn_bmatch = QPushButton("Match")
-        btn_bmatch.setToolTip("Find peaks + match each checked spectrum.")
-        btn_bmatch.clicked.connect(self.bulk_match_checked)
+        btn_bmatch.setToolTip(
+            "Find peaks + match each checked spectrum\n"
+            "(or highlighted rows if none are checked).\n"
+            "Same as the toolbar Find peaks + match button."
+        )
+        btn_bmatch.clicked.connect(self.run_match)
         bulk_btns.addWidget(btn_bmatch)
         btn_quant = QPushButton("Quant")
         btn_quant.setToolTip(
@@ -1333,14 +1350,19 @@ class LibsExplorerWindow(QMainWindow):
         self.periodic_table = PeriodicTableWidget()
         self.periodic_table.setToolTip(
             "Click an element to view its NIST lines.\n"
-            "Double-click to pin / unpin on the plot (syncs with matched list).\n"
+            "Double-click to pin / unpin on the plot.\n"
+            "Right-click to add / remove from the Element ranking list.\n"
             "After Match, only Overlay (default top 5) are pinned — add more here."
         )
         self.periodic_table.elementViewed.connect(self._on_browse_element_viewed)
         self.periodic_table.elementPinToggled.connect(self._on_browse_element_pin_toggled)
+        self.periodic_table.elementAddToHits.connect(self._on_periodic_add_element)
+        self.periodic_table.elementRemoveFromHits.connect(self._on_periodic_remove_element)
         browse_layout.addWidget(self.periodic_table, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        pt_hint = QLabel("Click = view · double-click = pin on plot (Overlay starts at top 5)")
+        pt_hint = QLabel(
+            "Click = view · double-click = pin · right-click = add/remove identified"
+        )
         pt_hint.setStyleSheet("color: #666; font-size: 11px;")
         pt_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         browse_layout.addWidget(pt_hint)
@@ -1673,8 +1695,8 @@ class LibsExplorerWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage(
-                f"Loaded {n} spectra — use Prev/Next, Waterfall, Mean/Sum, "
-                "or Match/Quant on checked files."
+                f"Loaded {n} spectra — check files to Match/Quant, "
+                "or use Prev/Next, Waterfall, Mean/Sum."
             )
 
     def _fill_spectra_list(self, *, check_all: bool = False) -> None:
@@ -2286,37 +2308,182 @@ class LibsExplorerWindow(QMainWindow):
         self.meta_text.setPlainText("\n".join(lines))
 
     # ------------------------------------------------------------ analysis
+    def _spectra_for_match(self) -> list[Spectrum]:
+        """Checked spectra, else highlighted rows, else the active spectrum."""
+        targets = self._spectra_for_list_actions()
+        if targets:
+            return targets
+        if self.spectrum is not None:
+            return [self.spectrum]
+        return []
+
+    def _build_match_cache_for_spectrum(
+        self,
+        spec: Spectrum,
+        *,
+        prom: float,
+        tol: float,
+        manual_peaks: list[Peak] | None = None,
+        keep_manual_hits: list[ElementHit] | None = None,
+    ) -> SpectrumMatchCache:
+        """Find peaks + NIST match for one spectrum → cache entry."""
+        manuals = list(manual_peaks or [])
+        auto = find_spectrum_peaks(spec, min_prominence_frac=prom)
+        manuals = [
+            mp
+            for mp in manuals
+            if not any(abs(mp.wavelength_nm - ap.wavelength_nm) < 0.05 for ap in auto)
+        ]
+        peaks = merge_peaks(auto, manuals)
+        if peaks and self.library:
+            support: dict[str, float] = {}
+            primary: dict[str, bool] = {}
+            primary_wl: dict[str, float] = {}
+            matches = match_peaks(
+                peaks,
+                self.library,
+                tol_nm=tol,
+                diagnostic_support_out=support,
+                primary_diagnostic_out=primary,
+                primary_wavelength_out=primary_wl,
+            )
+            scored = score_elements(
+                matches,
+                min_peaks=2,
+                diagnostic_support=support,
+                primary_diagnostic=primary,
+                primary_wavelength=primary_wl,
+            )
+            scored_els = {h.element for h in scored}
+            prior_manuals = [
+                h
+                for h in (keep_manual_hits or [])
+                if h.manual and h.element not in scored_els
+            ]
+            prior_spec = self.spectrum
+            prior_peaks = self.peaks
+            self.spectrum = spec
+            self.peaks = peaks
+            try:
+                extras = [
+                    self._build_manual_element_hit(h.element) for h in prior_manuals
+                ]
+            finally:
+                self.spectrum = prior_spec
+                self.peaks = prior_peaks
+            hits = scored + extras
+        else:
+            matches = []
+            hits = []
+        return SpectrumMatchCache(
+            auto_peaks=list(auto),
+            manual_peaks=list(manuals),
+            peaks=list(peaks),
+            hits=list(hits),
+            peak_matches=list(matches),
+        )
+
     def run_match(self) -> None:
-        if self.spectrum is None:
-            QMessageBox.information(self, "No spectrum", "Open a spectrum first.")
+        """Find peaks + match for selected spectra (checked / highlighted / active)."""
+        targets = self._spectra_for_match()
+        if not targets:
+            QMessageBox.information(
+                self,
+                "No spectrum",
+                "Open a spectrum first, or check / highlight files in the list.",
+            )
             return
         if not self.library:
-            QMessageBox.warning(self, "No library", f"NIST library not found at\n{DEFAULT_LIBRARY}")
+            QMessageBox.warning(
+                self, "No library", f"NIST library not found at\n{DEFAULT_LIBRARY}"
+            )
             return
 
         tol = float(self.spin_tol.value())
         prom = float(self.spin_prom.value())
-        self.auto_peaks = find_spectrum_peaks(self.spectrum, min_prominence_frac=prom)
-        # Drop manuals that now coincide with an auto peak
-        self.manual_peaks = [
-            mp
-            for mp in self.manual_peaks
-            if not any(abs(mp.wavelength_nm - ap.wavelength_nm) < 0.05 for ap in self.auto_peaks)
-        ]
-        self.peaks = merge_peaks(self.auto_peaks, self.manual_peaks)
-        self._rematch_peaks(tol=tol, clear_selection=True)
-        self._save_match_cache()
-        n_man = len(self.manual_peaks)
-        man_note = f" + {n_man} manual" if n_man else ""
+        active_path = (
+            self.spectrum.meta.path.resolve()
+            if self.spectrum is not None
+            else None
+        )
+
+        n_ok = 0
+        for i, spec in enumerate(targets):
+            if len(targets) > 1:
+                self.statusBar().showMessage(
+                    f"Match {i + 1}/{len(targets)}: {spec.meta.path.name}…"
+                )
+                QApplication.processEvents()
+
+            key = spec.meta.path.name
+            if (
+                active_path is not None
+                and spec.meta.path.resolve() == active_path
+            ):
+                manuals = list(self.manual_peaks)
+                keep_hits = list(self.hits)
+            else:
+                prev = self._match_cache.get(key)
+                manuals = list(prev.manual_peaks) if prev else []
+                keep_hits = list(prev.hits) if prev else []
+
+            self._match_cache[key] = self._build_match_cache_for_spectrum(
+                spec,
+                prom=prom,
+                tol=tol,
+                manual_peaks=manuals,
+                keep_manual_hits=keep_hits,
+            )
+            n_ok += 1
+
+        self._fill_spectra_list(check_all=False)
+
+        # Waterfall hides peaks/sticks — show results in Single mode
+        show = targets[0]
+        if active_path is not None:
+            for spec in targets:
+                if spec.meta.path.resolve() == active_path:
+                    show = spec
+                    break
+        try:
+            show_idx = self.loaded_spectra.index(show)
+        except ValueError:
+            show_idx = 0 if self.loaded_spectra else -1
+
+        if show_idx >= 0:
+            self._set_display_mode("single", redraw=False)
+            self._activate_loaded_at_index(
+                show_idx, restore_cache=True, reset_view=False
+            )
+        else:
+            key = show.meta.path.name
+            if key in self._match_cache:
+                self._restore_match_cache(key)
+                self._fill_element_table()
+                self._redraw(reset_view=False)
+            self._sync_calibrate_context()
+
+        n_hits = len(self.hits)
         n_pin = len(self._selected_elements)
         ov = self._overlay_mode_label()
-        self.statusBar().showMessage(
-            f"Found {len(self.auto_peaks)} auto peaks{man_note} "
-            f"→ {len(self.hits)} elements ranked; pinned {n_pin} on plot "
-            f"(Overlay={ov}). Double-click to add/remove; Unpin clears.  "
-            f"(atm={self.combo_atm.currentText()})"
-        )
-        self._sync_calibrate_context()
+        if n_ok == 1:
+            n_man = len(self.manual_peaks)
+            man_note = f" + {n_man} manual" if n_man else ""
+            self.statusBar().showMessage(
+                f"Found {len(self.auto_peaks)} auto peaks{man_note} "
+                f"→ {n_hits} elements ranked; pinned {n_pin} on plot "
+                f"(Overlay={ov}).  (atm={self.combo_atm.currentText()})"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Matched {n_ok} spectra → showing {show.meta.path.name} "
+                f"({n_hits} elements, {n_pin} pinned). "
+                "Use Prev/Next to review other matched files."
+            )
+
+    def bulk_match_checked(self) -> None:
+        """Alias for ``run_match`` (menu compatibility)."""
+        self.run_match()
 
     def _rematch_peaks(self, *, tol: float | None = None, clear_selection: bool = False) -> None:
         """Re-run NIST matching on current auto+manual peaks."""
@@ -2332,7 +2499,10 @@ class LibsExplorerWindow(QMainWindow):
         if tol is None:
             tol = float(self.spin_tol.value())
         if not self.peaks:
-            self.hits = []
+            manuals = [h for h in self.hits if h.manual]
+            self.hits = [
+                self._build_manual_element_hit(h.element) for h in manuals
+            ]
             self.peak_matches = []
         else:
             support: dict[str, float] = {}
@@ -2347,13 +2517,21 @@ class LibsExplorerWindow(QMainWindow):
                 primary_wavelength_out=primary_wl,
             )
             self.peak_matches = list(matches)
-            self.hits = score_elements(
+            scored = score_elements(
                 matches,
                 min_peaks=2,
                 diagnostic_support=support,
                 primary_diagnostic=primary,
                 primary_wavelength=primary_wl,
             )
+            # Keep user-added elements that Match did not rank
+            scored_els = {h.element for h in scored}
+            manuals = [
+                self._build_manual_element_hit(h.element)
+                for h in self.hits
+                if h.manual and h.element not in scored_els
+            ]
+            self.hits = scored + manuals
         if clear_selection:
             # Auto-pin matched elements on the periodic table and select them
             self._pin_matched_elements()
@@ -2382,93 +2560,6 @@ class LibsExplorerWindow(QMainWindow):
         self._redraw(reset_view=False)
         self._save_match_cache()
 
-    def bulk_match_checked(self) -> None:
-        """Find peaks + NIST match on each checked spectrum; cache hits per file."""
-        checked = self._checked_spectra()
-        if not checked:
-            QMessageBox.information(
-                self,
-                "No spectra checked",
-                "Check one or more spectra in the list, then Bulk match.",
-            )
-            return
-        if not self.library:
-            QMessageBox.warning(self, "No library", f"NIST library not found at\n{DEFAULT_LIBRARY}")
-            return
-
-        tol = float(self.spin_tol.value())
-        prom = float(self.spin_prom.value())
-        # Preserve current working view
-        prev_spec = self.spectrum
-        prev_label = self._working_label
-        prev_mode = self._display_mode
-        prev_index = self._spectrum_index
-
-        n_ok = 0
-        for i, spec in enumerate(checked):
-            self.statusBar().showMessage(
-                f"Bulk match {i + 1}/{len(checked)}: {spec.meta.path.name}…"
-            )
-            QApplication.processEvents()
-            auto = find_spectrum_peaks(spec, min_prominence_frac=prom)
-            peaks = merge_peaks(auto, [])
-            if peaks and self.library:
-                support: dict[str, float] = {}
-                primary: dict[str, bool] = {}
-                primary_wl: dict[str, float] = {}
-                matches = match_peaks(
-                    peaks,
-                    self.library,
-                    tol_nm=tol,
-                    diagnostic_support_out=support,
-                    primary_diagnostic_out=primary,
-                    primary_wavelength_out=primary_wl,
-                )
-                hits = score_elements(
-                    matches,
-                    min_peaks=2,
-                    diagnostic_support=support,
-                    primary_diagnostic=primary,
-                    primary_wavelength=primary_wl,
-                )
-            else:
-                matches = []
-                hits = []
-            key = spec.meta.path.name
-            self._match_cache[key] = SpectrumMatchCache(
-                auto_peaks=list(auto),
-                manual_peaks=[],
-                peaks=list(peaks),
-                hits=list(hits),
-                peak_matches=list(matches),
-            )
-            n_ok += 1
-
-        self._fill_spectra_list(check_all=False)
-
-        # Restore previous working spectrum / cache
-        if prev_spec is not None:
-            self.spectrum = prev_spec
-            self._working_label = prev_label
-            self._spectrum_index = prev_index
-            self._display_mode = prev_mode
-            if hasattr(self, "combo_display_mode"):
-                self._set_display_mode(prev_mode, redraw=False)
-            key = self._cache_key_for_spectrum(prev_spec)
-            if key and not self._restore_match_cache(key):
-                # Combined working spectrum — keep whatever was active
-                pass
-            self._update_working_label()
-            self._update_meta_panel()
-            self._fill_element_table()
-            self._redraw(reset_view=False)
-            self._sync_calibrate_context()
-
-        self.statusBar().showMessage(
-            f"Bulk match done — {n_ok} spectrum{'a' if n_ok != 1 else ''} cached. "
-            "Use Single + Prev/Next to review."
-        )
-
     def _highlighted_spectra(self) -> list[Spectrum]:
         """Spectra highlighted in the list (row selection), not necessarily checked."""
         if not hasattr(self, "spectra_list"):
@@ -2494,7 +2585,7 @@ class LibsExplorerWindow(QMainWindow):
         return out
 
     def _spectra_for_list_actions(self) -> list[Spectrum]:
-        """Spectra for Mean / Sum / View / Remove.
+        """Spectra for Mean / Sum / View / Remove / Match.
 
         Prefer checked boxes (Select all / Deselect all); if none are checked,
         use highlighted list rows (Shift/⌘ multi-select).
@@ -2699,9 +2790,20 @@ class LibsExplorerWindow(QMainWindow):
         self._clear_table(self.elem_table)
         self.elem_table.setRowCount(len(self.hits[:40]))
         for i, hit in enumerate(self.hits[:40]):
-            self.elem_table.setItem(i, 0, QTableWidgetItem(hit.element))
+            el_item = QTableWidgetItem(hit.element)
+            if hit.manual:
+                el_item.setToolTip("User-added from periodic table (right-click)")
+            self.elem_table.setItem(i, 0, el_item)
             self.elem_table.setItem(i, 1, QTableWidgetItem(str(hit.n_peaks)))
-            self.elem_table.setItem(i, 2, QTableWidgetItem(f"{hit.confidence:.0f}"))
+            conf = f"{hit.confidence:.0f}"
+            if hit.manual and hit.n_peaks == 0:
+                conf = "—"
+            elif hit.manual:
+                conf = f"{hit.confidence:.0f}*"
+            conf_item = QTableWidgetItem(conf)
+            if hit.manual:
+                conf_item.setToolTip("User-added; * = peaks found near NIST lines")
+            self.elem_table.setItem(i, 2, conf_item)
         self.elem_table.resizeColumnsToContents()
         sm = self.elem_table.selectionModel()
         if sm is not None and prev:
@@ -3034,10 +3136,11 @@ class LibsExplorerWindow(QMainWindow):
     def _on_browse_element_pin_toggled(self, symbol: str) -> None:
         if symbol in self._pinned_browse_elements:
             self._set_element_selected(symbol, selected=False)
-            msg = f"Unpinned {symbol} (removed from matched list)"
+            msg = f"Unpinned {symbol}"
         else:
+            self._ensure_element_in_hits(symbol)
             self._set_element_selected(symbol, selected=True)
-            msg = f"Pinned {symbol} (added to matched list)"
+            msg = f"Pinned {symbol} (in identified list)"
         # Refresh ranking-table selection to match pins
         self._fill_element_table()
         # Also view the pinned element so the line table matches
@@ -3047,6 +3150,131 @@ class LibsExplorerWindow(QMainWindow):
             self._fill_matched_lines_table(hit)
         self._redraw(reset_view=False)
         self.statusBar().showMessage(msg)
+
+    def _matches_near_element_lines(self, symbol: str) -> list[Match]:
+        """Assign peaks to this element's NIST lines within Tol (independent of Match winners)."""
+        if not self.peaks or not self.library:
+            return []
+        tol = float(self.spin_tol.value()) if hasattr(self, "spin_tol") else 0.12
+        el_lines = [L for L in self.library if L.element == symbol]
+        if not el_lines:
+            return []
+        # Strongest NIST lines first so diagnostics claim peaks before weak overlaps
+        el_lines = sorted(
+            el_lines,
+            key=lambda L: (
+                -(L.intensity if L.intensity is not None else 0.0),
+                L.wavelength_nm,
+            ),
+        )
+        used: set[int] = set()
+        matches: list[Match] = []
+        for line in el_lines:
+            best_i = -1
+            best_d = tol + 1.0
+            for i, peak in enumerate(self.peaks):
+                if i in used:
+                    continue
+                d = abs(float(peak.wavelength_nm) - float(line.wavelength_nm))
+                if d <= tol and d < best_d:
+                    best_d = d
+                    best_i = i
+            if best_i >= 0:
+                peak = self.peaks[best_i]
+                used.add(best_i)
+                matches.append(
+                    Match(
+                        peak=peak,
+                        line=line,
+                        delta_nm=float(peak.wavelength_nm) - float(line.wavelength_nm),
+                    )
+                )
+        return matches
+
+    def _build_manual_element_hit(self, symbol: str) -> ElementHit:
+        """Build a user-added ElementHit, optionally with peaks near NIST lines."""
+        matches = self._matches_near_element_lines(symbol)
+        if matches:
+            scored = score_elements(matches, min_peaks=1)
+            if scored:
+                hit = scored[0]
+                return ElementHit(
+                    element=hit.element,
+                    n_peaks=hit.n_peaks,
+                    score=hit.score,
+                    confidence=hit.confidence,
+                    matches=hit.matches,
+                    manual=True,
+                )
+        return ElementHit(
+            element=symbol,
+            n_peaks=0,
+            score=0.0,
+            confidence=0.0,
+            matches=[],
+            manual=True,
+        )
+
+    def _ensure_element_in_hits(self, symbol: str) -> ElementHit:
+        """Make sure ``symbol`` appears in the Element ranking list."""
+        symbol = (symbol or "").strip()
+        existing = next((h for h in self.hits if h.element == symbol), None)
+        if existing is not None:
+            return existing
+        hit = self._build_manual_element_hit(symbol)
+        # Put user-added entries after auto-ranked, but visible near the top if few hits
+        self.hits.append(hit)
+        return hit
+
+    def _on_periodic_add_element(self, symbol: str) -> None:
+        symbol = (symbol or "").strip()
+        if not symbol:
+            return
+        if self.spectrum is None:
+            self.statusBar().showMessage("Open a spectrum before adding elements.")
+            return
+        already = next((h for h in self.hits if h.element == symbol), None)
+        hit = self._ensure_element_in_hits(symbol)
+        self._set_element_selected(symbol, selected=True)
+        self._set_browse_element(symbol)
+        # Show the ranking list so the new row is visible
+        if hasattr(self, "side_tabs"):
+            self.side_tabs.setCurrentIndex(0)
+        self._fill_element_table()
+        if hit.matches:
+            self._fill_matched_lines_table(hit)
+        self._redraw(reset_view=False)
+        self._save_match_cache()
+        if already is not None:
+            self.statusBar().showMessage(
+                f"{symbol} already in identified list "
+                f"({hit.n_peaks} peak(s), {hit.confidence:.0f}%) — selected"
+            )
+        elif hit.n_peaks:
+            self.statusBar().showMessage(
+                f"Added {symbol} to identified elements "
+                f"({hit.n_peaks} peak(s) near NIST lines, {hit.confidence:.0f}%)"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Added {symbol} to identified elements "
+                f"(no peaks within Tol — NIST sticks still available)"
+            )
+
+    def _on_periodic_remove_element(self, symbol: str) -> None:
+        symbol = (symbol or "").strip()
+        if not symbol:
+            return
+        before = len(self.hits)
+        self.hits = [h for h in self.hits if h.element != symbol]
+        self._set_element_selected(symbol, selected=False)
+        self._fill_element_table()
+        self._redraw(reset_view=False)
+        self._save_match_cache()
+        if len(self.hits) < before:
+            self.statusBar().showMessage(f"Removed {symbol} from identified elements")
+        else:
+            self.statusBar().showMessage(f"{symbol} was not in the identified list")
 
     def _clear_browse_pins(self) -> None:
         if not self._pinned_browse_elements and not self._selected_elements:
@@ -3845,46 +4073,27 @@ class LibsExplorerWindow(QMainWindow):
             return
 
         atm = self.combo_atm.currentText()
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save identification report",
+            str(ROOT / "reports" / f"{opts['stem']}_lines.docx"),
+            "Word document (*.docx)",
+        )
+        if not path:
+            return
         try:
-            if opts["format"] == "pdf":
-                path, _ = QFileDialog.getSaveFileName(
-                    self,
-                    "Save publication report PDF",
-                    str(ROOT / "reports" / f"{opts['stem']}_lines.pdf"),
-                    "PDF (*.pdf)",
-                )
-                if not path:
-                    return
-                out = export_element_report_pdf(
-                    self.spectrum,
-                    hits,
-                    Path(path),
-                    n_lines=opts["n_lines"],
-                    half_width_nm=opts["half_width_nm"],
-                    atmosphere=atm,
-                )
-                msg = f"Wrote PDF report: {out}"
-            else:
-                path = QFileDialog.getExistingDirectory(
-                    self,
-                    "Choose folder for PNG figures",
-                    str(ROOT / "reports"),
-                )
-                if not path:
-                    return
-                paths = export_element_report_pngs(
-                    self.spectrum,
-                    hits,
-                    Path(path),
-                    n_lines=opts["n_lines"],
-                    half_width_nm=opts["half_width_nm"],
-                    atmosphere=atm,
-                )
-                msg = f"Wrote {len(paths)} PNG figure(s) to {path}"
+            out = export_element_report_docx(
+                self.spectrum,
+                hits,
+                Path(path),
+                half_width_nm=opts["half_width_nm"],
+                atmosphere=atm,
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
             return
 
+        msg = f"Wrote Word report: {out}"
         self.statusBar().showMessage(msg)
         QMessageBox.information(self, "Report exported", msg)
 

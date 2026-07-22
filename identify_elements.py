@@ -469,6 +469,8 @@ class ElementHit:
     score: float
     confidence: float  # 0–100% identification confidence
     matches: list[Match]
+    #: User-added from periodic table (kept across rematch when still absent)
+    manual: bool = False
 
 
 def _has_nearby_peak(

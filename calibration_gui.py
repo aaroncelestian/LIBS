@@ -8,7 +8,14 @@ import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, QEvent, QPoint, QSize, QTimer, QUrl, Signal
-from PySide6.QtGui import QCursor, QDragEnterEvent, QDragMoveEvent, QDropEvent
+from PySide6.QtGui import (
+    QCursor,
+    QDragEnterEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QGuiApplication,
+    QMouseEvent,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -71,13 +78,16 @@ class _LineHoverPreview(QFrame):
     """Frameless popup with a mini peak/baseline plot for one diagnostic line."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
+        # ToolTip avoids Windows focus/activation quirks that hide Tool popups.
         super().__init__(
             parent,
-            Qt.WindowType.Tool
+            Qt.WindowType.ToolTip
             | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint,
+            | Qt.WindowType.WindowDoesNotAcceptFocus,
         )
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        # Keep mouse events on the table so Leave does not fire as soon as we show.
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setStyleSheet(
             "QFrame { background: #fafafa; border: 1px solid #888; border-radius: 4px; }"
         )
@@ -369,7 +379,11 @@ class CalibrationTab(QWidget):
         )
         self.line_table.horizontalHeader().setStretchLastSection(True)
         self.line_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        # Windows needs tracking on the viewport for cellEntered / hover move events.
         self.line_table.setMouseTracking(True)
+        self.line_table.viewport().setMouseTracking(True)
+        self.line_table.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.line_table.viewport().setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.line_table.itemChanged.connect(self._on_line_item_changed)
         self.line_table.itemSelectionChanged.connect(self._on_line_selection_for_plot)
         self.line_table.cellEntered.connect(self._on_line_cell_entered)
@@ -1867,18 +1881,48 @@ class CalibrationTab(QWidget):
         return min(wls), max(wls)
 
     def _on_line_cell_entered(self, row: int, _column: int) -> None:
+        self._arm_line_hover(row)
+
+    def _arm_line_hover(self, row: int) -> None:
+        if row < 0 or row >= self.line_table.rowCount():
+            return
+        if row == self._line_hover_row and (
+            self._line_hover_popup is not None and self._line_hover_popup.isVisible()
+        ):
+            return
         self._line_hover_row = row
         self._line_hover_timer.start()
 
     def _hide_line_hover_preview(self) -> None:
         self._line_hover_timer.stop()
+        self._line_hover_row = -1
         if self._line_hover_popup is not None:
             self._line_hover_popup.hide()
             self._line_hover_popup._key = None
 
+    def _place_hover_popup(self, popup: QWidget) -> None:
+        """Offset from cursor; clamp to the screen under the cursor (Windows DPI-safe)."""
+        pos = QCursor.pos() + QPoint(18, 14)
+        screen = QGuiApplication.screenAt(QCursor.pos())
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        popup.adjustSize()
+        if screen is not None:
+            geo = screen.availableGeometry()
+            w = max(popup.width(), 1)
+            h = max(popup.height(), 1)
+            x = min(max(pos.x(), geo.left()), geo.right() - w)
+            y = min(max(pos.y(), geo.top()), geo.bottom() - h)
+            pos = QPoint(x, y)
+        popup.move(pos)
+
     def _show_line_hover_preview(self) -> None:
         row = self._line_hover_row
         if row < 0 or row >= self.line_table.rowCount():
+            return
+        # Cursor may have left the table during the delay (common on Windows).
+        vp = self.line_table.viewport()
+        if not vp.rect().contains(vp.mapFromGlobal(QCursor.pos())):
             return
         item = self.line_table.item(row, 0)
         if item is None:
@@ -1889,10 +1933,13 @@ class CalibrationTab(QWidget):
         el, wl = key
         spec, label = self._peak_qc_spectrum()
         if spec is None:
+            self.statusMessage.emit(
+                "Hover preview needs a QC spectrum — add a standard or load Identify data."
+            )
             return
         self._sync_params_from_ui()
         if self._line_hover_popup is None:
-            self._line_hover_popup = _LineHoverPreview(self)
+            self._line_hover_popup = _LineHoverPreview(self.window())
         self._line_hover_popup.show_line(
             spectrum=spec,
             label=label or "QC",
@@ -1905,10 +1952,9 @@ class CalibrationTab(QWidget):
             shift_tol_nm=self.cal.shift_tol_nm,
             snip_iterations=self.cal.snip_iterations,
         )
-        # Place near cursor, keep on screen
-        pos = QCursor.pos() + QPoint(18, 14)
-        self._line_hover_popup.move(pos)
+        self._place_hover_popup(self._line_hover_popup)
         self._line_hover_popup.show()
+        self._line_hover_popup.raise_()
 
     def _fill_line_table(self) -> None:
         self.line_table.blockSignals(True)
@@ -2243,12 +2289,25 @@ class CalibrationTab(QWidget):
 
     def eventFilter(self, watched, event):  # noqa: N802 — Qt API
         et = event.type()
-        if (
-            hasattr(self, "line_table")
-            and watched is self.line_table.viewport()
-            and et in (QEvent.Type.Leave, QEvent.Type.HoverLeave)
-        ):
-            self._hide_line_hover_preview()
+        if hasattr(self, "line_table") and watched is self.line_table.viewport():
+            if et in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
+                self._hide_line_hover_preview()
+            elif et in (QEvent.Type.MouseMove, QEvent.Type.HoverMove):
+                # Fallback when cellEntered does not fire (seen on some Windows setups).
+                pos = None
+                if isinstance(event, QMouseEvent):
+                    pos = event.position().toPoint()
+                elif hasattr(event, "position"):
+                    try:
+                        pos = event.position().toPoint()
+                    except Exception:
+                        pos = None
+                if pos is not None:
+                    idx = self.line_table.indexAt(pos)
+                    if idx.isValid():
+                        self._arm_line_hover(idx.row())
+                    else:
+                        self._hide_line_hover_preview()
         if et in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
             if isinstance(event, (QDragEnterEvent, QDragMoveEvent)):
                 txts, csvs = self._drop_paths_from_mime(event.mimeData())
